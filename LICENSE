@@ -1,6 +1,10 @@
 MIT License
 
-Copyright (c) 2026 wangyancz
+Copyright (c) 2026 村长wy (yue-metal)
+
+Copyright (c) 2024-2025 Salvatore Sanfilippo <antirez@gmail.com> (h3-metal,
+vendored Metal runtime, weight plumbing, tokenizer and linenoise terminal
+components retained under their original h3_ names)
 
 Permission is hereby granted, free of charge, to any person obtaining a copy
 of this software and associated documentation files (the "Software"), to deal
