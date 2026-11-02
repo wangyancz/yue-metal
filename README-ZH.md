@@ -45,6 +45,11 @@ GEMM 的权重流从两遍并成一遍（见性能节）；flow 侧 yue 的 NAR/
 
 - 权重：`/Volumes/Work/models/YuE2.models/lyra-YuE2-3B`（ar-bf16 + nar-bf16 + qwen.tiktoken）
   与同级独立目录 `lyra-YuE2-3B-vae`（`--vae` 缺省时自动按 `<model>-vae` 推导）。
+- 也支持官方原版布局直读：`-d` 指向 m-a-p/YuE2-3B 单文件 `model.safetensors`
+  目录（权重与 lyra 分区字节级一致，全 628 张量 sha256 验证；缺 ar-bf16/nar-bf16
+  时自动回退到单文件），VAE 用 `--vae` 指向 m-a-p/YuE2-Vae 目录（键/形状/dtype
+  与 lyra vae 完全同构，加载路径不变）。官方目录自带
+  `yue2_generation_config.json`（与内置默认逐字段一致）。
 - 参考栈：`/Volumes/Work/mlx-Yue`（lyra MLX 包 + 其 `.venv`，仅测试 fixture 生成时使用）。
 - 运行依赖：Metal、MetalPerformanceShaders(+Graph)、Accelerate、ffmpeg（FLAC 转码，PATH 中可用）。
 

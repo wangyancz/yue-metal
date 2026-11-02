@@ -7,7 +7,9 @@
 #include "h3_gpu.h"
 #include "yue.h"
 
-/* YuE2 AR model: Qwen3 backbone loaded from lyra-YuE2-3B (ar-bf16.safetensors).
+/* YuE2 AR model: Qwen3 backbone loaded from a model directory — either the
+ * lyra split (ar-bf16.safetensors) or the official m-a-p/YuE2-3B single-file
+ * checkpoint (model.safetensors; same keys, byte-identical values).
  * Numeric conventions mirror lyra ar.py: fp32 RMSNorm variance with bf16
  * double rounding, fp32 SiLU opmath, half-split RoPE with fp32 angles,
  * phase-local output projection in bf16. */

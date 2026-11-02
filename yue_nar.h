@@ -16,7 +16,8 @@
 typedef struct yue_nar yue_nar;
 typedef struct yue_nar_chunk yue_nar_chunk;
 
-/* Loads nar-bf16.safetensors (acoustic experts + heads); `ar` supplies the
+/* Loads the acoustic experts + heads (nar-bf16.safetensors in the lyra
+ * split, or the official single-file model.safetensors); `ar` supplies the
  * shared embedding, final norm and conditioning backbone and must outlive
  * the NAR instance. */
 yue_nar *yue_nar_create(h3_gpu *gpu, yue_ar *ar, const char *model_dir,

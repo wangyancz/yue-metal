@@ -13,6 +13,23 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/stat.h>
+
+/* Weight file resolution: prefer the lyra split layout (ar-bf16 /
+ * nar-bf16.safetensors); fall back to the official single-file checkpoint
+ * (m-a-p/YuE2-3B model.safetensors), which carries both partitions under the
+ * same tensor key names (byte-identical to the lyra split, all 628 tensors
+ * verified). If neither file exists the caller's header read reports the
+ * model.safetensors path. */
+static int resolve_weights_path(char *out, size_t size, const char *model_dir,
+                                const char *split_name) {
+    int written = snprintf(out, size, "%s/%s", model_dir, split_name);
+    if (written < 0 || (size_t)written >= size) return 0;
+    struct stat st;
+    if (stat(out, &st) == 0) return 1;
+    written = snprintf(out, size, "%s/model.safetensors", model_dir);
+    return written >= 0 && (size_t)written < size;
+}
 
 #define YUE_AR_KV_HEADS YUE_KV_HEADS
 #define YUE_AR_PAIRS (YUE_HEAD_DIM / 2)
@@ -154,9 +171,8 @@ yue_ar *yue_ar_create(h3_gpu *gpu, const char *model_dir, char *error,
     }
     ar->gpu = gpu;
     ar->layers = YUE_AR_LAYERS;
-    int path_len = snprintf(ar->weights_path, sizeof(ar->weights_path),
-                            "%s/ar-bf16.safetensors", model_dir);
-    if (path_len < 0 || (size_t)path_len >= sizeof(ar->weights_path)) {
+    if (!resolve_weights_path(ar->weights_path, sizeof(ar->weights_path),
+                              model_dir, "ar-bf16.safetensors")) {
         set_error(error, error_size, "model directory path is too long");
         free(ar);
         return NULL;

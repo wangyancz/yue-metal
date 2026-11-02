@@ -52,6 +52,14 @@ Historical: M10 (321-char request profile) semantic 19.9 ms/token, RTF 0.80
 - Weights: `/Volumes/Work/models/YuE2.models/lyra-YuE2-3B` (ar-bf16 + nar-bf16 +
   qwen.tiktoken) plus a sibling directory `lyra-YuE2-3B-vae` (when `--vae` is
   omitted it is derived as `<model>-vae`).
+- The official layout is also supported directly: point `-d` at the m-a-p/YuE2-3B
+  directory with its single-file `model.safetensors` (byte-identical to the lyra
+  partition, verified by sha256 across all 628 tensors; the engine falls back to
+  the single file automatically when ar-bf16/nar-bf16 are absent), and point
+  `--vae` at the m-a-p/YuE2-Vae directory (its keys/shapes/dtypes are fully
+  isomorphic to the lyra vae, so the loading path is unchanged). The official
+  directory ships a `yue2_generation_config.json` that matches the built-in
+  defaults field by field.
 - Reference stack: `/Volumes/Work/mlx-Yue` (lyra MLX package + its `.venv`;
   only used to generate test fixtures).
 - Runtime dependencies: Metal, MetalPerformanceShaders(+Graph), Accelerate,

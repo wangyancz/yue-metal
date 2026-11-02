@@ -13,6 +13,19 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/stat.h>
+
+/* Weight file resolution, mirroring yue_ar.m: prefer the lyra split layout,
+ * fall back to the official single-file checkpoint. */
+static int resolve_weights_path(char *out, size_t size, const char *model_dir,
+                                const char *split_name) {
+    int written = snprintf(out, size, "%s/%s", model_dir, split_name);
+    if (written < 0 || (size_t)written >= size) return 0;
+    struct stat st;
+    if (stat(out, &st) == 0) return 1;
+    written = snprintf(out, size, "%s/model.safetensors", model_dir);
+    return written >= 0 && (size_t)written < size;
+}
 
 #define YUE_NAR_KV_HEADS YUE_KV_HEADS
 #define YUE_NAR_PAIRS (YUE_HEAD_DIM / 2)
@@ -142,8 +155,12 @@ yue_nar *yue_nar_create(h3_gpu *gpu, yue_ar *ar, const char *model_dir,
     nar->gpu = gpu;
     nar->ar = ar;
     nar->layers = YUE_AR_LAYERS;
-    snprintf(nar->weights_path, sizeof(nar->weights_path), "%s/nar-bf16.safetensors",
-             model_dir);
+    if (!resolve_weights_path(nar->weights_path, sizeof(nar->weights_path),
+                              model_dir, "nar-bf16.safetensors")) {
+        yue_nar_free(nar);
+        set_error(error, error_size, "model directory path is too long");
+        return NULL;
+    }
 
     h3_st_header header;
     if (!h3_st_read_header(nar->weights_path, &header, error, error_size)) {
