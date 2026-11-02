@@ -43,13 +43,13 @@ GEMM 的权重流从两遍并成一遍（见性能节）；flow 侧 yue 的 NAR/
 
 ## 模型与依赖
 
-- 权重：`/Volumes/Work/models/YuE2.models/lyra-YuE2-3B`（ar-bf16 + nar-bf16 + qwen.tiktoken）
-  与同级独立目录 `lyra-YuE2-3B-vae`（`--vae` 缺省时自动按 `<model>-vae` 推导）。
-- 也支持官方原版布局直读：`-d` 指向 m-a-p/YuE2-3B 单文件 `model.safetensors`
-  目录（权重与 lyra 分区字节级一致，全 628 张量 sha256 验证；缺 ar-bf16/nar-bf16
-  时自动回退到单文件），VAE 用 `--vae` 指向 m-a-p/YuE2-Vae 目录（键/形状/dtype
-  与 lyra vae 完全同构，加载路径不变）。官方目录自带
-  `yue2_generation_config.json`（与内置默认逐字段一致）。
+- 权重：`/Volumes/Work/models/YuE2.models/YuE2-3B`（m-a-p 官方单文件
+  `model.safetensors`）+ VAE 目录 `YuE2-Vae`（`--vae` 缺省时自动按
+  `<model>-vae` 推导，官方命名需显式传 `--vae`）。
+- 也支持 lyra 转换布局直读：`-d` 指向含 `ar-bf16`/`nar-bf16.safetensors`
+  的目录（权重与官方单文件字节级一致，全 628 张量 sha256 验证；缺 ar-bf16/
+  nar-bf16 时自动回退到单文件），VAE 键/形状/dtype 与官方完全同构。
+  官方目录自带 `yue2_generation_config.json`（与内置默认逐字段一致）。
 - 参考栈：`/Volumes/Work/mlx-Yue`（lyra MLX 包 + 其 `.venv`，仅测试 fixture 生成时使用）。
 - 运行依赖：Metal、MetalPerformanceShaders(+Graph)、Accelerate、ffmpeg（FLAC 转码，PATH 中可用）。
 
@@ -65,7 +65,7 @@ make m0-tests tokenizer-tests gemv-tests ar-tests sampling-tests nar-tests vae-t
 ```sh
 # JSONL 服务模式
 printf '%s\n' '{"id":"t","style":"upbeat pop","lyrics":"[verse]\nla la la\n[chorus]\nna na na","cot":"off","cfgScale":1.2,"seed":831001,"output":"/tmp/t.flac"}' \
-  | ./yue serve -d /Volumes/Work/models/YuE2.models/lyra-YuE2-3B
+  | ./yue serve -d /Volumes/Work/models/YuE2.models/YuE2-3B --vae /Volumes/Work/models/YuE2.models/YuE2-Vae
 
 # 常驻 REPL（linenoise）
 ./yue repl -d MODEL_DIR [--vae VAE_DIR]

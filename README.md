@@ -49,15 +49,15 @@ Historical: M10 (321-char request profile) semantic 19.9 ms/token, RTF 0.80
 
 ## Model & Dependencies
 
-- Weights: `/Volumes/Work/models/YuE2.models/lyra-YuE2-3B` (ar-bf16 + nar-bf16 +
-  qwen.tiktoken) plus a sibling directory `lyra-YuE2-3B-vae` (when `--vae` is
-  omitted it is derived as `<model>-vae`).
-- The official layout is also supported directly: point `-d` at the m-a-p/YuE2-3B
-  directory with its single-file `model.safetensors` (byte-identical to the lyra
-  partition, verified by sha256 across all 628 tensors; the engine falls back to
-  the single file automatically when ar-bf16/nar-bf16 are absent), and point
-  `--vae` at the m-a-p/YuE2-Vae directory (its keys/shapes/dtypes are fully
-  isomorphic to the lyra vae, so the loading path is unchanged). The official
+- Weights: `/Volumes/Work/models/YuE2.models/YuE2-3B` (the official m-a-p
+  single-file `model.safetensors`) plus the `YuE2-Vae` directory (when `--vae`
+  is omitted it is derived as `<model>-vae`; the official naming requires an
+  explicit `--vae`).
+- The lyra conversion layout is also supported directly: point `-d` at a
+  directory containing `ar-bf16`/`nar-bf16.safetensors` (byte-identical to the
+  official single file, verified by sha256 across all 628 tensors; the engine
+  falls back to the single file automatically when they are absent). The vae
+  keys/shapes/dtypes are fully isomorphic between both layouts. The official
   directory ships a `yue2_generation_config.json` that matches the built-in
   defaults field by field.
 - Reference stack: `/Volumes/Work/mlx-Yue` (lyra MLX package + its `.venv`;
@@ -77,7 +77,7 @@ make m0-tests tokenizer-tests gemv-tests ar-tests sampling-tests nar-tests vae-t
 ```sh
 # JSONL service mode
 printf '%s\n' '{"id":"t","style":"upbeat pop","lyrics":"[verse]\nla la la\n[chorus]\nna na na","cot":"off","cfgScale":1.2,"seed":831001,"output":"/tmp/t.flac"}' \
-  | ./yue serve -d /Volumes/Work/models/YuE2.models/lyra-YuE2-3B
+  | ./yue serve -d /Volumes/Work/models/YuE2.models/YuE2-3B --vae /Volumes/Work/models/YuE2.models/YuE2-Vae
 
 # Persistent REPL (linenoise)
 ./yue repl -d MODEL_DIR [--vae VAE_DIR]
