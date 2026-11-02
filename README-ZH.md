@@ -1,6 +1,6 @@
 # yue-metal — YuE2-3B 原生 Metal 推理引擎
 
-English documentation: [README.en.md](README.en.md)
+English documentation: [README.md](README.md)
 
 YuE2-3B 歌曲生成模型（AR 语义 token + NAR 声学流匹配 + Oobleck VAE）的原生推理引擎，
 纯 C11 + Objective-C/Metal，面向 Apple Silicon（M 系统一体内存）。数值约定逐点复刻

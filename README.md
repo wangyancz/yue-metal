@@ -1,6 +1,6 @@
 # yue-metal — Native Metal Inference Engine for YuE2-3B
 
-中文文档：[README.md](README.md)
+中文文档：[README-ZH.md](README-ZH.md)
 
 A native inference engine for the YuE2-3B song-generation model (AR semantic
 tokens + NAR acoustic flow matching + Oobleck VAE), written in plain C11 +
