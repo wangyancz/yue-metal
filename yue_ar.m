@@ -80,8 +80,10 @@ struct yue_ar {
     size_t ws_rows;
     h3_gpu_tensor *x, *normed, *q, *k, *v, *attn, *branch, *fc1out, *mlp_mid;
     h3_gpu_tensor *causal_limit; /* u32 per query row (padded) */
-    /* Split-K decode SDPA partials: [head][split][head_dim+2] fp32
-     * (acc[128], m, l). Fixed size; decode steps only. */
+    /* Split-K decode SDPA partials: [head][split][head_dim+32] fp32
+     * (acc[128], m, l, 30 pad — stride 640 B = 5 cache lines, see the
+     * merge kernel comment for the false-sharing bug this avoids).
+     * Fixed size; decode steps only. */
     h3_gpu_tensor *sdpa_partial;
     uint32_t q_pad_rows;
 };
@@ -283,10 +285,12 @@ yue_ar *yue_ar_create(h3_gpu *gpu, const char *model_dir, char *error,
     /* Phase-local lm_head slices, mapped straight from the checkpoint
      * (zero-copy). */
     const h3_st_tensor *lm = h3_st_find(&header, "lm_head.weight");
-    if (!lm || lm->dtype != H3_DTYPE_BF16) {
+    if (!lm || lm->dtype != H3_DTYPE_BF16 || lm->ndim != 2 ||
+        lm->shape[1] != YUE_HIDDEN || lm->shape[0] < YUE_LATENT_START) {
         h3_st_free_header(&header);
         yue_ar_free(ar);
-        set_error(error, error_size, "lm_head.weight missing or not BF16");
+        set_error(error, error_size,
+                  "lm_head.weight missing or has an invalid shape");
         return NULL;
     }
     uint64_t row_bytes = (uint64_t)YUE_HIDDEN * sizeof(uint16_t);
@@ -350,7 +354,7 @@ int yue_ar_rope_slice(yue_ar *ar, size_t offset, size_t rows,
                       h3_gpu_tensor **cos_out, h3_gpu_tensor **sin_out,
                       char *error, size_t error_size) {
     if (!ar || !cos_out || !sin_out || !rows ||
-        offset + rows > YUE_CONTEXT) {
+        offset > YUE_CONTEXT || rows > YUE_CONTEXT - offset) {
         set_error(error, error_size, "invalid rope slice request");
         return 0;
     }
@@ -524,7 +528,7 @@ static int workspace_reserve(yue_ar *ar, size_t rows, char *error,
     ar->causal_limit = NULL;
     size_t hidden_elems = cap * YUE_HIDDEN;
     size_t partial_elems = (size_t)YUE_HEADS * YUE_AR_MAX_SPLITS *
-                           (YUE_HEAD_DIM + 2);
+                           (YUE_HEAD_DIM + 32);
     if (!ar->sdpa_partial)
         ar->sdpa_partial = h3_gpu_tensor_new_f32(ar->gpu, partial_elems);
     if (!ar->sdpa_partial) {
@@ -1159,7 +1163,9 @@ static h3_gpu_tensor *forward_run2(yue_ar *ar, uint32_t token_pos,
                   h3_gpu_error(ar->gpu));
         return NULL;
     }
-    h3_gpu_begin(ar->gpu);
+    /* The caller (decode_step2) owns the open command buffer. Calling
+     * h3_gpu_begin() here is a no-op normally, but with a closed chain it
+     * would open a fresh buffer and split the caller's work in two. */
 
     for (int i = 0; ok && i < ar->layers; i++) {
         const yue_ar_layer *layer = &ar->layer[i];
@@ -1397,9 +1403,11 @@ h3_gpu_tensor *yue_ar_embed(yue_ar *ar, const uint32_t *tokens, size_t count,
 }
 
 h3_gpu_tensor *yue_ar_cache_key(yue_ar_cache *cache, int layer) {
-    return cache && cache->keys ? cache->keys[layer] : NULL;
+    return cache && cache->keys && layer >= 0 && layer < cache->layers
+               ? cache->keys[layer] : NULL;
 }
 
 h3_gpu_tensor *yue_ar_cache_value(yue_ar_cache *cache, int layer) {
-    return cache && cache->values ? cache->values[layer] : NULL;
+    return cache && cache->values && layer >= 0 && layer < cache->layers
+               ? cache->values[layer] : NULL;
 }

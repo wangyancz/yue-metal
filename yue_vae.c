@@ -204,15 +204,18 @@ static int vae_upload_gpu(yue_vae *vae, char *error, size_t error_size) {
     }
     if (ok && !h3_gpu_submit(gpu)) {
         set_error(error, error_size, "vae gpu upload: %s", h3_gpu_error(gpu));
-        return 0;
+        ok = 0;
     }
     if (!ok) {
         /* The chain is open with partially encoded uploads; drain it or
-         * every later h3_gpu_begin on the shared context fails forever. */
+         * every later h3_gpu_begin on the shared context fails forever.
+         * Also restore the caller's open chain on this path (the failed
+         * submit above used to return before doing so). */
         (void)h3_gpu_submit(gpu);
         if (was_open) (void)h3_gpu_begin(gpu);
-        set_error(error, error_size, "vae gpu upload: %s",
-                  h3_gpu_error(gpu));
+        if (error && error_size && !error[0])
+            set_error(error, error_size, "vae gpu upload: %s",
+                      h3_gpu_error(gpu));
         return 0;
     }
     if (was_open) (void)h3_gpu_begin(gpu);
@@ -303,6 +306,24 @@ yue_vae *yue_vae_create(const char *model_dir, h3_gpu *gpu, char *error,
     for (int i = 0; i < n_mults; i++)
         vae->c_mults[i + 1] = (int)yw_json_number(yw_json_at(mults, i));
     yw_json_free(root);
+
+    /* Config values feed divisions, sizes and (size_t) casts. Reject
+     * zero/negative/out-of-range values here instead of dividing by zero
+     * or wrapping an allocation size further down the decoder. */
+    if (vae->channels < 1 || vae->latent_dim < 1 ||
+        vae->out_channels < 1) {
+        yue_vae_free(vae);
+        set_error(error, error_size, "bad decoder channel dimensions");
+        return NULL;
+    }
+    for (int i = 0; i < n_strides; i++) {
+        if (vae->strides[i] < 1 || vae->strides[i] > 64 ||
+            vae->c_mults[i + 1] < 1) {
+            yue_vae_free(vae);
+            set_error(error, error_size, "bad decoder strides/c_mults values");
+            return NULL;
+        }
+    }
 
     /* layer plan: conv_in, blocks (snake, convt, 3x[snake,conv,snake,conv]),
      * snake, conv_out */
@@ -428,8 +449,12 @@ yue_vae *yue_vae_create(const char *model_dir, h3_gpu *gpu, char *error,
             }
             snprintf(name, sizeof(name), "%s.beta", layer->key);
             if (!read_tensor(&header, name, &beta, shape, &ndim, error,
-                             error_size)) {
+                             error_size) ||
+                ndim != 1 || shape[0] != layer->cin ||
+                beta.count != (size_t)layer->cin ||
+                alpha.count != (size_t)layer->cin) {
                 free(alpha.data);
+                free(beta.data);
                 h3_st_free_header(&header);
                 yue_vae_free(vae);
                 return NULL;
@@ -556,7 +581,11 @@ static void snake_forward(float *x, size_t count, int channels,
      * scalar loop except the sin itself (vvsinf vs sinf may differ by
      * 1 ulp on some inputs — inside the fixture noise band). Falls back
      * to the scalar loop if the scratch allocation fails. */
-    float *scratch = malloc(sizeof(float) * count * 2);
+    /* vvsinf takes an int element count and scratch is 2*count floats;
+     * fall back to the scalar loop if either would truncate or wrap. */
+    float *scratch = (count > (size_t)2147483647 ||
+                      count > ((size_t)-1) / (2 * sizeof(float)))
+                         ? NULL : malloc(sizeof(float) * count * 2);
     if (!scratch) {
         for (size_t i = 0; i < count; i++) {
             int c = (int)(i % (size_t)channels);
@@ -718,12 +747,13 @@ static int decoder_pass(const yue_vae *vae, const float *latents, size_t t_in,
             if (caps[dst] < need) {
                 free(bufs[dst]);
                 bufs[dst] = malloc(sizeof(float) * need);
-                caps[dst] = need;
                 if (!bufs[dst]) {
+                    caps[dst] = 0;
                     set_error(error, error_size, "out of memory (vae buffers)");
                     ok = 0;
                     break;
                 }
+                caps[dst] = need;
             }
             memcpy(bufs[dst], x, sizeof(float) * need);
             snake_forward(bufs[dst], need, c_cur, layer->ea, layer->eb);
@@ -741,12 +771,13 @@ static int decoder_pass(const yue_vae *vae, const float *latents, size_t t_in,
             if (caps[dst] < need) {
                 free(bufs[dst]);
                 bufs[dst] = malloc(sizeof(float) * need);
-                caps[dst] = need;
                 if (!bufs[dst]) {
+                    caps[dst] = 0;
                     set_error(error, error_size, "out of memory (vae buffers)");
                     ok = 0;
                     break;
                 }
+                caps[dst] = need;
             }
             float *outb = bufs[dst];
             if (layer->kind == YUE_L_CONVT) {
@@ -1067,8 +1098,12 @@ static int decoder_pass_gpu(const yue_vae *vae, const float *latents,
             set_error(error, error_size, "vae audio readback failed");
             ok = 0;
         }
-    } else {
-        (void)h3_gpu_submit(gpu); /* drain any partially encoded chain */
+    }
+    if (!ok) {
+        /* Also covers failures that flipped ok inside the block above
+         * (tanh / channel mismatch / submit): the chain is still open and
+         * must be drained before the caller releases its scratch tensors. */
+        (void)h3_gpu_submit(gpu);
     }
     if (was_open) {
         /* The submits above closed the caller's chain too (our work was
@@ -1159,15 +1194,21 @@ int yue_write_wav24(const char *path, const float *samples, size_t frames,
         set_error(error, error_size, "invalid wav arguments");
         return 0;
     }
-    FILE *file = fopen(path, "wb");
-    if (!file) {
-        set_error(error, error_size, "cannot open %s", path);
+    /* Compute the RIFF size before opening the file: frames*channels*3
+     * must not wrap size_t (a wrapped value would slip past the 4 GiB
+     * guard and produce a truncated file with a bogus header). */
+    if (frames > ((size_t)-1) / 3 / (size_t)channels) {
+        set_error(error, error_size, "wav too large for a RIFF header");
         return 0;
     }
     size_t data_bytes = frames * (size_t)channels * 3;
     if (data_bytes > 0xFFFFFFFFu - 44) {
-        fclose(file); /* the guard runs after fopen; do not leak the fd */
         set_error(error, error_size, "wav too large for a RIFF header");
+        return 0;
+    }
+    FILE *file = fopen(path, "wb");
+    if (!file) {
+        set_error(error, error_size, "cannot open %s", path);
         return 0;
     }
     unsigned char header[44];
@@ -1223,7 +1264,10 @@ int yue_write_wav24(const char *path, const float *samples, size_t frames,
         set_error(error, error_size, "wav write failed");
         return 0;
     }
-    fclose(file);
+    if (fclose(file) != 0) {
+        set_error(error, error_size, "wav close failed");
+        return 0;
+    }
     return 1;
 }
 
@@ -1235,17 +1279,34 @@ int yue_wav_to_flac(const char *wav_path, const char *flac_path, char *error,
     }
     /* posix_spawnp with an argument array (same discipline as h3_ffmpeg.c):
      * paths are passed verbatim, so quotes or shell metacharacters in the
-     * output filename can neither break the command nor inject code. */
-    char *arguments[] = {"ffmpeg", "-y", "-loglevel", "error", "-i",
-                         (char *)wav_path, "-c:a", "flac",
-                         (char *)flac_path, NULL};
+     * output filename can neither break the command nor inject code. A
+     * leading '-' would still be parsed by ffmpeg as an option (argv is not
+     * a shell), so prefix such relative paths with ./ (same file, same cwd). */
     const char *override = getenv("H3_FFMPEG");
     const char *program = override && *override ? override : "ffmpeg";
+    char *normalized = NULL;
+    const char *out_arg = flac_path;
+    if (flac_path[0] == '-') {
+        size_t n = strlen(flac_path);
+        normalized = malloc(n + 3);
+        if (!normalized) {
+            set_error(error, error_size, "out of memory (flac path)");
+            return 0;
+        }
+        normalized[0] = '.';
+        normalized[1] = '/';
+        memcpy(normalized + 2, flac_path, n + 1);
+        out_arg = normalized;
+    }
+    char *arguments[] = {(char *)program, "-y", "-loglevel", "error", "-i",
+                         (char *)wav_path, "-c:a", "flac",
+                         (char *)out_arg, NULL};
     pid_t child = -1;
     int code = posix_spawnp(&child, program, NULL, NULL, arguments, environ);
     if (code != 0) {
         set_error(error, error_size, "cannot start ffmpeg: %s",
                   strerror(code));
+        free(normalized);
         return 0;
     }
     int status = 0;
@@ -1253,6 +1314,7 @@ int yue_wav_to_flac(const char *wav_path, const char *flac_path, char *error,
         if (errno == EINTR) continue;
         set_error(error, error_size, "cannot wait for ffmpeg: %s",
                   strerror(errno));
+        free(normalized);
         return 0;
     }
     if (!WIFEXITED(status) || WEXITSTATUS(status) != 0) {
@@ -1260,7 +1322,9 @@ int yue_wav_to_flac(const char *wav_path, const char *flac_path, char *error,
                   WIFEXITED(status)
                       ? "check input/output paths"
                       : "killed by signal");
+        free(normalized);
         return 0;
     }
+    free(normalized);
     return 1;
 }

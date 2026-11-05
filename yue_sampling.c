@@ -108,6 +108,10 @@ void yue_window_penalty(float *scores, size_t width, const int *recent_local,
     for (size_t u = 0; u < unique; u++) {
         float alpha = powf(base, (float)counts[u]);
         if (legacy) alpha = yue_bf16_round(alpha);
+        /* A non-finite/zero factor would turn logits into NaN/Inf (and can
+         * resurrect the EOS row that min_tokens just masked). Skip this
+         * token's penalty instead. */
+        if (!(alpha > 0.0f) || !isfinite(alpha)) continue;
         float s = scores[ids[u]];
         /* lyra multiplies negatives and divides non-negatives; -inf passes
          * through both. */
@@ -208,6 +212,11 @@ static void apply_top_p(float *scores, scored_cell *survivors,
 int yue_distribution(float *scores, size_t width, yue_phase phase,
                      const yue_sampling *sp, const uint32_t *history,
                      size_t history_len, int step, int legacy) {
+    /* Public API: the phase end index and the fixed-size window scratch
+     * assume the canonical projection width. Reject a mismatched buffer
+     * instead of writing scores[end_local] out of bounds. */
+    if (!scores || !sp || width != yue_phase_width(phase) ||
+        (history_len && !history)) return 0;
     /* min-tokens: mask the phase end before anything else. */
     if (step < sp->min_tokens)
         scores[yue_phase_end_local(phase)] = -INFINITY;

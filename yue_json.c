@@ -130,6 +130,10 @@ static char *parse_string(yw_json_parser *parser) {
             fail(parser, "unterminated string");
             return NULL;
         }
+        if ((unsigned char)*scan < 0x20) {
+            fail(parser, "control character in string");
+            return NULL;
+        }
         if (*scan == '\\') {
             scan++;
             if (*scan == '\0') {
@@ -186,11 +190,11 @@ static char *parse_string(yw_json_parser *parser) {
                     return NULL;
                 }
                 p += 4;
-                if (code == 0) {
-                    /* An embedded NUL would truncate every downstream
-                     * strlen-based consumer. */
+                if (code < 0x20) {
+                    /* Control characters (NUL in particular) would
+                     * truncate or corrupt downstream C-string consumers. */
                     free(out);
-                    fail(parser, "\\u0000 is not allowed in strings");
+                    fail(parser, "control character escape is not allowed");
                     return NULL;
                 }
                 if (code >= 0xD800 && code <= 0xDBFF && p[0] == '\\' &&
@@ -354,9 +358,30 @@ static yw_json *parse_value_inner(yw_json_parser *parser) {
         return value;
     }
     if (c == '-' || (c >= '0' && c <= '9')) {
+        const char *p = parser->cursor, *q = p;
+        /* strtod() also accepts hex floats ("0x1p3") and leading zeros,
+         * neither of which is a JSON number. Validate the grammar first
+         * and require strtod() to consume exactly that span. */
+        int valid = 1;
+        if (*q == '-') q++;
+        if (*q == '0') q++;
+        else if (*q >= '1' && *q <= '9') {
+            while (*q >= '0' && *q <= '9') q++;
+        } else valid = 0;
+        if (valid && *q == '.') {
+            q++;
+            if (*q < '0' || *q > '9') valid = 0;
+            while (*q >= '0' && *q <= '9') q++;
+        }
+        if (valid && (*q == 'e' || *q == 'E')) {
+            q++;
+            if (*q == '+' || *q == '-') q++;
+            if (*q < '0' || *q > '9') valid = 0;
+            while (*q >= '0' && *q <= '9') q++;
+        }
         char *end = NULL;
-        double number = strtod(parser->cursor, &end);
-        if (end == parser->cursor || !isfinite(number)) {
+        double number = strtod(p, &end);
+        if (!valid || end != q || !isfinite(number)) {
             fail(parser, "bad number");
             return NULL;
         }
@@ -389,7 +414,9 @@ static yw_json *parse_value(yw_json_parser *parser) {
 int yw_json_parse(const char *text, yw_json **out, char *error,
                   size_t error_size) {
     if (error && error_size > 0) error[0] = '\0';
-    if (!text || !out) return 0;
+    if (!out) return 0;
+    *out = NULL;
+    if (!text) return 0;
     yw_json_parser parser = {text, error, error_size, 0};
     yw_json *value = parse_value(&parser);
     if (!value) return 0;
@@ -465,6 +492,9 @@ int yw_json_get_bool(const yw_json *value, const char *key, int fallback) {
     const yw_json *item = yw_json_get(value, key);
     /* An explicit null falls back too: yw_json_bool(NULL) is 0, which is
      * not the caller's default. */
-    if (!item || item->kind == yue_json_NULL) return fallback;
+    if (!item || item->kind == yue_json_NULL ||
+        (item->kind != yue_json_BOOL && item->kind != yue_json_NUMBER &&
+         item->kind != yue_json_STRING))
+        return fallback;
     return yw_json_bool(item);
 }

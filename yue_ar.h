@@ -55,8 +55,8 @@ h3_gpu_tensor *yue_ar_forward_open(yue_ar *ar, const uint32_t *tokens,
 
 /* Batched CFG decode forward (M15): one [2, hidden] stream, both branch
  * rows riding every linear (one weight read; probe H: rows=2 = 0.98x
- * rows=1 gpu time on the big shapes). count must be 1 — one decode
- * token per branch. Each row attends and writes its own cache; the two
+ * rows=1 gpu time on the big shapes). One decode token per branch,
+ * i.e. exactly two rows. Each row attends and writes its own cache; the two
  * caches advance independently. Returns the [2, hidden] final-normed
  * hidden (row 0 = pos, row 1 = neg). */
 h3_gpu_tensor *yue_ar_forward_open2(yue_ar *ar, uint32_t token_pos,

@@ -22,9 +22,10 @@ static int resolve_weights_path(char *out, size_t size, const char *model_dir,
     int written = snprintf(out, size, "%s/%s", model_dir, split_name);
     if (written < 0 || (size_t)written >= size) return 0;
     struct stat st;
-    if (stat(out, &st) == 0) return 1;
+    if (stat(out, &st) == 0 && S_ISREG(st.st_mode)) return 1;
     written = snprintf(out, size, "%s/model.safetensors", model_dir);
-    return written >= 0 && (size_t)written < size;
+    if (written < 0 || (size_t)written >= size) return 0;
+    return stat(out, &st) == 0 && S_ISREG(st.st_mode);
 }
 
 #define YUE_NAR_KV_HEADS YUE_KV_HEADS
@@ -264,7 +265,7 @@ yue_nar *yue_nar_create(h3_gpu *gpu, yue_ar *ar, const char *model_dir,
     /* latent_pos_embed.pe: [max_latent_frames, hidden] */
     const h3_st_tensor *pe = h3_st_find(&header, "latent_pos_embed.pe");
     if (!pe || pe->dtype != H3_DTYPE_BF16 || pe->ndim != 2 ||
-        pe->shape[1] != YUE_HIDDEN) {
+        pe->shape[1] != YUE_HIDDEN || pe->shape[0] < 1) {
         h3_st_free_header(&header);
         yue_nar_free(nar);
         set_error(error, error_size, "latent_pos_embed.pe missing or invalid");
@@ -374,7 +375,19 @@ static int workspace_reserve(yue_nar *nar, size_t rows, char *error,
                              size_t error_size) {
     if (nar->ws_rows >= rows) return 1;
     size_t cap = nar->ws_rows ? nar->ws_rows : 1024;
-    while (cap < rows) cap *= 2;
+    /* The tensor sizes below multiply cap by up to 2*YUE_MLP elements;
+     * refuse pathological row counts instead of wrapping size_t. */
+    if (rows > ((size_t)-1) / (2 * YUE_MLP)) {
+        set_error(error, error_size, "NAR workspace too large");
+        return 0;
+    }
+    while (cap < rows) {
+        if (cap > ((size_t)-1) / 2) {
+            set_error(error, error_size, "NAR workspace too large");
+            return 0;
+        }
+        cap *= 2;
+    }
     h3_gpu_tensor_free(nar->x);
     h3_gpu_tensor_free(nar->normed);
     h3_gpu_tensor_free(nar->q);
@@ -558,12 +571,17 @@ yue_ar_cache *yue_nar_chunk_cond(yue_nar_chunk *chunk) {
 void yue_nar_chunk_free(yue_nar_chunk *chunk) {
     if (!chunk) return;
     yue_ar_cache_free(chunk->cond);
+    /* ck/cv are allocated independently: either calloc may fail on its own,
+     * so each array must be released independently (a NULL cv[i] access
+     * would crash, and a NULL ck would leak cv entirely). */
     if (chunk->ck) {
-        for (int i = 0; i < YUE_AR_LAYERS; i++) {
+        for (int i = 0; i < YUE_AR_LAYERS; i++)
             h3_gpu_tensor_free(chunk->ck[i]);
-            h3_gpu_tensor_free(chunk->cv[i]);
-        }
         free(chunk->ck);
+    }
+    if (chunk->cv) {
+        for (int i = 0; i < YUE_AR_LAYERS; i++)
+            h3_gpu_tensor_free(chunk->cv[i]);
         free(chunk->cv);
     }
     h3_gpu_tensor_free(chunk->rope_cos);

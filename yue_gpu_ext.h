@@ -53,7 +53,8 @@ int qw_gpu_qk_rope_half_bf16(h3_gpu *gpu, h3_gpu_tensor *query_output,
                              uint32_t heads, uint32_t head_dim);
 
 /* RMSNorm with PyTorch CPU bf16 rounding points: normalized fp32 value
- * quantized to bf16 BEFORE the weight multiply (double rounding). */int qw_gpu_rms_norm_bf16(h3_gpu *gpu, h3_gpu_tensor *output,
+ * quantized to bf16 BEFORE the weight multiply (double rounding). */
+int qw_gpu_rms_norm_bf16(h3_gpu *gpu, h3_gpu_tensor *output,
                          const h3_gpu_tensor *input,
                          const h3_gpu_tensor *weight, uint32_t rows,
                          uint32_t width, float epsilon);
@@ -203,7 +204,8 @@ int qw_gpu_sdpa_decode_bf16(h3_gpu *gpu, h3_gpu_tensor *output,
 
 /* Split-K decode SDPA (q_rows == 1, flash-decoding): phase 1 over
  * (heads x splits) slabs into the caller-owned fp32 `partial` scratch
- * (>= heads*max_splits*(head_dim+2) elements), phase 2 merges. splits
+ * (>= heads*max_splits*(head_dim+32) elements — slot stride is 640 B
+ * cache-line aligned, see the merge kernel), phase 2 merges. splits
  * is derived from kv_rows (256-row slabs) and clamped to max_splits.
  * Two dispatches inside one command encoder. */
 int qw_gpu_sdpa_decode_split_bf16(h3_gpu *gpu, h3_gpu_tensor *output,
@@ -227,6 +229,21 @@ int qw_gpu_sdpa_decode_split_bf16_off(h3_gpu *gpu, h3_gpu_tensor *output,
                                       uint32_t kv_heads, uint32_t head_dim,
                                       float scale, h3_gpu_tensor *partial,
                                       uint32_t max_splits);
+
+/* Vectorized split decode SDPA (M18): same contract as
+ * qw_gpu_sdpa_decode_split_bf16; K rows are loaded as uint4 in the score
+ * pass. `tile` selects the smem scores tile (128 / 256 / 512); tile=128
+ * is bit-exact with the scalar split kernel, larger tiles change the
+ * sum-reduction order (occasional 1-ulp output flips, same class as
+ * flash2-vs-scalar). */
+int qw_gpu_sdpa_decode_split_v_bf16(h3_gpu *gpu, h3_gpu_tensor *output,
+                                    const h3_gpu_tensor *query,
+                                    const h3_gpu_tensor *key,
+                                    const h3_gpu_tensor *value,
+                                    uint32_t kv_rows, uint32_t heads,
+                                    uint32_t kv_heads, uint32_t head_dim,
+                                    float scale, h3_gpu_tensor *partial,
+                                    uint32_t max_splits, uint32_t tile);
 
 /* [C, H, W] <-> [H, W, C] layout transposes. */
 int qw_gpu_vae_chw_to_hwc_f32(h3_gpu *gpu, h3_gpu_tensor *output,

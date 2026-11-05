@@ -134,7 +134,12 @@ static int ensure_parent_dir(const char *path) {
     }
     struct stat st;
     if (stat(buf, &st) == 0 && S_ISDIR(st.st_mode)) return 1;
-    return mkdir(buf, 0755) == 0 || errno == EEXIST;
+    if (mkdir(buf, 0755) != 0) {
+        /* EEXIST also covers "a regular file with that name exists" —
+         * re-check the type instead of treating it as success. */
+        return stat(buf, &st) == 0 && S_ISDIR(st.st_mode);
+    }
+    return 1;
 }
 
 static char *read_text_file(const char *path) {
@@ -149,7 +154,10 @@ static char *read_text_file(const char *path) {
         fclose(handle);
         return NULL;
     }
-    fseek(handle, 0, SEEK_SET);
+    if (fseek(handle, 0, SEEK_SET) != 0) {
+        fclose(handle);
+        return NULL;
+    }
     char *text = malloc((size_t)size + 1);
     if (!text) {
         fclose(handle);
@@ -157,6 +165,11 @@ static char *read_text_file(const char *path) {
     }
     size_t got = fread(text, 1, (size_t)size, handle);
     fclose(handle);
+    /* A short read or an embedded NUL would silently truncate lyrics. */
+    if (got != (size_t)size || memchr(text, '\0', got)) {
+        free(text);
+        return NULL;
+    }
     text[got] = '\0';
     return text;
 }
@@ -290,23 +303,39 @@ static void serve_json_escape(const char *in, char *out, size_t out_size) {
     out[o] = '\0';
 }
 
+/* Set right before the serve self-restart execve(). exec() destroys every
+ * other thread (including the heartbeat), so an emit must not be in flight
+ * and none may start afterwards. Guarded by g_emit_mu. */
+static int g_restarting = 0;
+
 /* One protocol line to stdout. The heartbeat thread writes concurrently,
- * so the write is serialized. 8 KB covers the longest done event (a
- * fully-escaped 3 KB path). */
+ * so the write is serialized. The frame (JSON + newline) is written in a
+ * single fwrite: otherwise execve() could kill a thread between the body
+ * and its newline, splicing two JSON objects into one protocol line.
+ * 32 KB covers the longest done event (a fully escaped 3 KB path, where
+ * each control character expands to six bytes). */
 static void serve_emit(const char *fmt, ...) {
-    char line[8192];
+    char line[32768];
     va_list args;
     va_start(args, fmt);
     int n = vsnprintf(line, sizeof(line), fmt, args);
     va_end(args);
     if (n <= 0) return;
-    /* vsnprintf returns the untruncated length — clamp or fwrite would
-     * read past the buffer on an over-long line. */
-    if ((size_t)n >= sizeof(line)) n = (int)sizeof(line) - 1;
     pthread_mutex_lock(&g_emit_mu);
-    fwrite(line, 1, (size_t)n, stdout);
-    fputc('\n', stdout);
-    fflush(stdout);
+    if (!g_restarting) {
+        if ((size_t)n >= sizeof(line) - 1) {
+            /* Never emit a truncated (invalid) JSON frame. */
+            static const char too_long[] =
+                "{\"type\":\"error\",\"id\":\"\","
+                "\"message\":\"protocol event too large\"}\n";
+            fwrite(too_long, 1, sizeof(too_long) - 1, stdout);
+        } else {
+            line[n++] = '\n';
+            if (fwrite(line, 1, (size_t)n, stdout) != (size_t)n)
+                log_stderr("protocol stdout write failed");
+        }
+        if (fflush(stdout) != 0) log_stderr("protocol stdout flush failed");
+    }
     pthread_mutex_unlock(&g_emit_mu);
 }
 
@@ -316,7 +345,8 @@ static void serve_error(const char *id, const char *fmt, ...) {
     va_start(args, fmt);
     vsnprintf(message, sizeof(message), fmt, args);
     va_end(args);
-    char message_esc[2048];
+    /* Worst case: each byte expands to a six-byte control escape. */
+    char message_esc[1024 * 6 + 8];
     serve_json_escape(message, message_esc, sizeof(message_esc));
     char id_esc[176];
     serve_json_escape(id ? id : "", id_esc, sizeof(id_esc));
@@ -727,6 +757,20 @@ static void serve_handle(yue_engine *eng, const yw_json *req) {
         serve_error(rid, "output path too long");
         goto done;
     }
+    for (const unsigned char *p = (const unsigned char *)output; *p; p++) {
+        if (*p < 0x20) {
+            serve_error(rid, "output path contains control characters");
+            goto done;
+        }
+    }
+    /* worker.py contract (documented in README): output is the FLAC file
+     * itself; ffmpeg is invoked with "-c:a flac", so a different container
+     * name would only produce a confusing encoder failure later. */
+    size_t output_len = strlen(output);
+    if (output_len < 5 || strcmp(output + output_len - 5, ".flac") != 0) {
+        serve_error(rid, "output path must end with .flac");
+        goto done;
+    }
 
     {
         int has_cfg = 0;
@@ -787,7 +831,8 @@ static void serve_handle(yue_engine *eng, const yw_json *req) {
         pthread_mutex_unlock(&g_prog.mu);
 
         if (ok) {
-            char rid_esc[176], path_esc[YUE_OUTPUT_MAX * 2 + 8];
+            /* Worst case: each path byte expands to a six-byte escape. */
+            char rid_esc[176], path_esc[YUE_OUTPUT_MAX * 6 + 8];
             serve_json_escape(rid, rid_esc, sizeof(rid_esc));
             serve_json_escape(output, path_esc, sizeof(path_esc));
             serve_emit("{\"type\":\"done\",\"id\":\"%s\",\"path\":\"%s\","
@@ -812,22 +857,51 @@ done:
 }
 
 /* Reads one request line (arbitrary length up to SERVE_LINE_MAX).
- * Returns 1 with *out malloc'd (no trailing newline); 0 on EOF. When the
- * limit is exceeded, *overflow is set, the rest of the line is drained
- * so the stream stays line-aligned, and *out stays NULL. */
-static int serve_read_line(char **out, int *overflow) {
+ * Returns 1 with *out malloc'd (no trailing newline); 0 on EOF; -1 on an
+ * allocation failure. An over-long line sets *overflow, one containing a
+ * raw NUL sets *malformed; both drain the rest of the physical line so the
+ * stream stays aligned and leave *out NULL. A final line without a
+ * trailing newline is accepted (EOF closes it). */
+static int serve_read_line(char **out, int *overflow, int *malformed) {
     *out = NULL;
     *overflow = 0;
+    *malformed = 0;
     size_t cap = 0;
     char *line = NULL;
     for (;;) {
         char chunk[4096];
+        memset(chunk, 0, sizeof(chunk));
         if (!fgets(chunk, sizeof(chunk), stdin)) {
+            if (cap) { /* final request without a trailing newline */
+                *out = line;
+                return 1;
+            }
             free(line);
             return 0;
         }
-        size_t len = strlen(chunk);
-        int complete = len > 0 && chunk[len - 1] == '\n';
+        /* fgets() stops at the newline (or after 4095 bytes / EOF) and
+         * terminates with NUL. Measure the physical bytes with the newline
+         * position, not strlen(): a raw NUL inside the line would hide the
+         * newline and make us splice the NEXT request onto this one. */
+        char *nl = memchr(chunk, '\n', sizeof(chunk));
+        size_t len = nl ? (size_t)(nl - chunk) + 1 : strlen(chunk);
+        if (!nl) {
+            /* With the chunk zeroed, any non-zero byte past the first NUL
+             * was written by fgets() and reveals an embedded NUL. */
+            for (size_t i = sizeof(chunk) - 1; i > len; i--) {
+                if (chunk[i]) { len = i + 1; break; }
+            }
+        }
+        int complete = nl != NULL;
+        if (memchr(chunk, '\0', len)) {
+            *malformed = 1;
+            while (!complete) {
+                int c = fgetc(stdin);
+                if (c == EOF || c == '\n') break;
+            }
+            free(line);
+            return 1;
+        }
         if (cap + len > SERVE_LINE_MAX) {
             *overflow = 1;
             while (!complete) {
@@ -850,8 +924,9 @@ static int serve_read_line(char **out, int *overflow) {
             return -1;
         }
         line = grown;
-        memcpy(line + cap, chunk, len + 1);
+        memcpy(line + cap, chunk, len);
         cap += len;
+        line[cap] = '\0';
         if (complete) {
             if (cap && line[cap - 1] == '\n') line[--cap] = '\0';
             if (cap && line[cap - 1] == '\r') line[--cap] = '\0';
@@ -894,16 +969,17 @@ static int cmd_serve(const char *model_dir, const char *vae_dir) {
                    esc);
         return 1;
     }
-    serve_emit("{\"type\":\"state\",\"state\":\"ready\",\"loadSeconds\":%.1f}",
-               now_seconds() - t0);
-    log_stderr("serve ready (%.1fs)", now_seconds() - t0);
-
     pthread_t beat;
     if (pthread_create(&beat, NULL, serve_heartbeat, NULL) != 0) {
         log_stderr("cannot start the heartbeat thread");
         serve_error("", "init: heartbeat");
         return 1;
     }
+    /* Do not advertise "ready" before the heartbeat exists: on creation
+     * failure the host would otherwise queue a request into a dead pipe. */
+    serve_emit("{\"type\":\"state\",\"state\":\"ready\",\"loadSeconds\":%.1f}",
+               now_seconds() - t0);
+    log_stderr("serve ready (%.1fs)", now_seconds() - t0);
 
     /* Soft self-restart (YUE_RESTART_AFTER, default 10 requests, 0 =
      * disabled). Metal is the one allocator whose freed pages are not
@@ -919,8 +995,13 @@ static int cmd_serve(const char *model_dir, const char *vae_dir) {
     {
         const char *env = getenv("YUE_RESTART_AFTER");
         if (env && *env) {
-            long value = atol(env);
-            restart_after = value > 0 ? (unsigned long long)value : 0;
+            char *end = NULL;
+            errno = 0;
+            long value = strtol(env, &end, 10);
+            if (errno == 0 && end != env && *end == '\0' && value >= 0)
+                restart_after = (unsigned long long)value;
+            else
+                log_stderr("ignoring invalid YUE_RESTART_AFTER=%s", env);
         }
     }
 
@@ -933,8 +1014,8 @@ static int cmd_serve(const char *model_dir, const char *vae_dir) {
 
     for (;;) {
         char *line;
-        int overflow = 0;
-        int got = serve_read_line(&line, &overflow);
+        int overflow = 0, malformed = 0;
+        int got = serve_read_line(&line, &overflow, &malformed);
         if (got < 0) {
             log_stderr("out of memory reading the request line");
             serve_error("", "out of memory");
@@ -944,6 +1025,11 @@ static int cmd_serve(const char *model_dir, const char *vae_dir) {
         if (overflow) {
             log_stderr("bad request line: exceeds %u bytes", SERVE_LINE_MAX);
             serve_error("", "request line too long");
+            continue;
+        }
+        if (malformed) {
+            log_stderr("bad request line: raw NUL byte");
+            serve_error("", "malformed request line");
             continue;
         }
         const char *trimmed = line;
@@ -970,10 +1056,20 @@ static int cmd_serve(const char *model_dir, const char *vae_dir) {
                        "driver-held Metal pages",
                        served);
             if (_NSGetExecutablePath(exe, &size) == 0) {
+                /* Quiesce the heartbeat under the emitter's lock: execve()
+                 * destroys that thread instantly, so no emit may be in
+                 * flight and none may start before the new image runs. */
+                pthread_mutex_lock(&g_emit_mu);
+                g_restarting = 1;
                 fflush(NULL);
+                pthread_mutex_unlock(&g_emit_mu);
                 execv(exe, g_argv);
+                int saved_errno = errno;
+                pthread_mutex_lock(&g_emit_mu);
+                g_restarting = 0;
+                pthread_mutex_unlock(&g_emit_mu);
                 log_stderr("execv failed: %s (continuing)",
-                           strerror(errno));
+                           strerror(saved_errno));
             }
             served = 0; /* keep serving if the restart failed */
         }
@@ -1005,6 +1101,7 @@ static const char *arg_after(const char *line, const char *cmd) {
 
 /* Interprets the C escapes that matter for lyrics input. */
 static void unescape_inplace(char *s) {
+    if (!s) return;
     char *w = s;
     for (char *r = s; *r; r++) {
         if (*r == '\\' && r[1]) {
@@ -1026,14 +1123,15 @@ static void unescape_inplace(char *s) {
     *w = '\0';
 }
 
-static void set_field(char **field, const char *value) {
+static int set_field(char **field, const char *value) {
     char *copy = strdup(value);
     if (!copy) {
         printf("out of memory\n");
-        return;
+        return 0;
     }
     free(*field);
     *field = copy;
+    return 1;
 }
 
 static void repl_show(const repl_state *st) {
@@ -1125,7 +1223,7 @@ static void repl_command(yue_engine *eng, repl_state *st, const char *line) {
             printf("usage: /style TEXT\n");
             return;
         }
-        set_field(&st->style, arg);
+        if (!set_field(&st->style, arg)) return;
         unescape_inplace(st->style);
         return;
     }
@@ -1149,7 +1247,7 @@ static void repl_command(yue_engine *eng, repl_state *st, const char *line) {
             printf("usage: /lyrics TEXT\n");
             return;
         }
-        set_field(&st->lyrics, arg);
+        if (!set_field(&st->lyrics, arg)) return;
         unescape_inplace(st->lyrics);
         return;
     }
@@ -1277,6 +1375,26 @@ static int copy_dir(char *out, size_t size, const char *value) {
     return 0;
 }
 
+/* ensure_shader_dir() can chdir() to the executable directory when the
+ * binary is launched from elsewhere; every argv-derived path must be made
+ * absolute before engine_load() resolves tokenizer/weights/output against
+ * it. Also gives --vae the same length check as -d. */
+static int absolutize_dir(char *out, size_t size, const char *value) {
+    if (!value || !*value) return copy_dir(out, size, value);
+    if (value[0] == '/') return copy_dir(out, size, value);
+    char cwd[YUE_DIR_MAX];
+    if (!getcwd(cwd, sizeof(cwd))) {
+        fprintf(stderr, "yue: cannot resolve the working directory\n");
+        return -1;
+    }
+    int written = snprintf(out, size, "%s/%s", cwd, value);
+    if (written < 0 || (size_t)written >= size) {
+        fprintf(stderr, "yue: model directory path is too long\n");
+        return -1;
+    }
+    return 0;
+}
+
 /* M14: default the decode GEMV path to the MLX-style 2D block kernel.
  * The per-column GEMV and the TensorOps GEMV both lose the execution
  * race, but qw_gemv2d_m64u8 matches MPS execution while saving ~3
@@ -1315,7 +1433,8 @@ int main(int argc, char **argv) {
     char resolved_model[YUE_DIR_MAX];
     char resolved_vae[YUE_DIR_MAX];
     memset(resolved_vae, 0, sizeof(resolved_vae));
-    if (copy_dir(resolved_model, sizeof(resolved_model), model_dir) != 0)
+    if (absolutize_dir(resolved_model, sizeof(resolved_model),
+                       model_dir) != 0)
         return 2;
 
     /* Default VAE: sibling <model>-vae directory (lyra layout). */
@@ -1324,6 +1443,11 @@ int main(int argc, char **argv) {
         int written = snprintf(resolved_vae, sizeof(resolved_vae), "%.*s-vae",
                                (int)len, resolved_model);
         if (written < 0 || (size_t)written >= sizeof(resolved_vae)) return 2;
+        vae_dir = resolved_vae;
+    } else if (absolutize_dir(resolved_vae, sizeof(resolved_vae),
+                              vae_dir) != 0) {
+        return 2;
+    } else {
         vae_dir = resolved_vae;
     }
 

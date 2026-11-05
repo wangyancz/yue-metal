@@ -5942,7 +5942,6 @@ kernel void qw_vae_avgdown_f32(
     constant uint4 &args [[buffer(2)]],   // (height, width, in_c, out_c)
     constant uint &ft [[buffer(3)]],
     uint2 gid [[thread_position_in_grid]]) {
-    if (gid.x == 0 && gid.y == 0) output[0] = 4242.0f; /* 临时：执行标记 */
     uint oh = args.x / 2, ow = args.y / 2;
     uint pixels = oh * ow;
     if (gid.x >= pixels || gid.y >= args.w) return;
@@ -6499,8 +6498,8 @@ template [[host_name("qw_gemv_qkv_bf16_u8")]] kernel qw_gemv_qkv_bf16_u8_t
  * Phase 2 merges the slabs per head with the standard flash-decoding
  * correction. Only fp32 accumulation ORDER differs from the flash2
  * tile kernel (~1e-7 relative, absorbed by the bf16 output rounding —
- * probe U bit-check). Layout of `partial`: [head][split][130] with
- * acc[128] then m then l. */
+ * probe U bit-check). Layout of `partial`: [head][split][160] with
+ * acc[128], then m/l, then pad filling the 640 B cacheline. */
 struct qw_sdpa_split_args {
     uint32_t kv_rows, heads, kv_heads, splits, split_rows;
     float scale;
@@ -6684,11 +6683,23 @@ kernel void qw_sdpa_decode_split_bf16(
         m = m_new;
         threadgroup_barrier(mem_flags::mem_threadgroup);
     }
-    float *dst = partial + ((size_t)head * args.splits + split) * (D + 2);
+    float *dst = partial + ((size_t)head * args.splits + split) * (D + 32);
+    /* Slot layout [acc 128][m][l][pad 30], stride D+32 = 160 floats =
+     * 640 B = 5 cache lines (cache-line-aligned slots). Probe V proved
+     * the store-loss mode: the lone 4B m/l store was silently lost by
+     * the memory system at high group counts — the value read back was
+     * a PREVIOUS dispatch's — while the fully-written acc lines never
+     * dropped (atomics did not help either). Fix: fill the m/l cache
+     * line completely (32 stores by tid<32, tid0/1 carry m/l, the rest
+     * zero the padding) AND cap the grid at 256 groups in the wrapper.
+     * The acc block keeps its cache-line-aligned start so the write
+     * pattern stays 4 full lines (the [m][l][acc] variant offset every
+     * store by 8 B and cost ~7% at kv=2048). */
     dst[tid] = accv;
-    if (tid == 0) {
-        dst[D] = m;
-        dst[D + 1] = l;
+    if (tid < 32) {
+        if (tid == 0) dst[D] = m;
+        else if (tid == 1) dst[D + 1] = l;
+        else dst[D + tid] = 0.0f;
     }
 }
 
@@ -6700,16 +6711,18 @@ kernel void qw_sdpa_decode_merge_bf16(
     uint tid [[thread_index_in_threadgroup]],
     uint threads [[threads_per_threadgroup]]) {
     constexpr uint D = 128;
+    /* Slot layout [acc 128][m][l][pad 30], stride D+32 = 160 floats —
+     * see the split kernel for the store-loss rationale. */
     if (head >= args.heads || threads != 128) return;
     device const float *base =
-        partial + (size_t)head * args.splits * (D + 2);
+        partial + (size_t)head * args.splits * (D + 32);
     float m = -3.402823466e+38f;
     for (uint s = 0; s < args.splits; s++)
-        m = max(m, base[s * (D + 2) + D]);
+        m = max(m, base[s * (D + 32) + D]);
     float accv = 0.0f;
     float l = 0.0f;
     for (uint s = 0; s < args.splits; s++) {
-        device const float *p = base + s * (D + 2);
+        device const float *p = base + s * (D + 32);
         float corr = (p[D] == -3.402823466e+38f) ? 0.0f : exp(p[D] - m);
         accv += corr * p[tid];
         l += corr * p[D + 1];
@@ -6718,3 +6731,130 @@ kernel void qw_sdpa_decode_merge_bf16(
      * a device ushort lvalue takes the VALUE (0.75 -> 0), not the bits */
     output[head * D + tid] = h3_f32_to_bf16(accv / l);
 }
+
+/* yue-metal M18: vectorized rewrite of qw_sdpa_decode_split_bf16.
+ * Same split/partial contract (qw_sdpa_decode_merge_bf16 is reused
+ * verbatim) with two changes:
+ *   1. Score pass loads each K row as 16 x uint4 (8 bf16 each) instead
+ *      of 128 scalar ushort loads. Each uint4 is unpacked low-half-first
+ *      (little-endian, contiguous bf16 array) and accumulated with the
+ *      same per-thread ascending fma chain, so the dot product is
+ *      bit-exact with the scalar kernel. Row base = (r*kv_heads+kv_head)
+ *      *256B is always 16B-aligned.
+ *   2. TILE is a template parameter. TILE=128 reproduces the scalar tile
+ *      structure (bit-exact output end to end). Larger tiles give each
+ *      thread several independent fma chains per tile (ILP) and divide
+ *      the two per-tile tree reductions; the sum-reduction order then
+ *      changes, so l differs ~1e-7 and occasional 1-ulp output flips are
+ *      expected — same order-difference class as flash2 vs scalar.
+ * smem: scores[TILE] + red[128] + qg[128]. */
+template <int TILE>
+kernel void qw_sdpa_dec_v_impl(
+    device const ushort *query [[buffer(0)]],
+    device const ushort *key [[buffer(1)]],
+    device const ushort *value [[buffer(2)]],
+    device float *partial [[buffer(3)]],
+    constant qw_sdpa_split_args &args [[buffer(4)]],
+    threadgroup float *scores [[threadgroup(0)]],
+    threadgroup float *red [[threadgroup(1)]],
+    threadgroup float *qg [[threadgroup(2)]],
+    uint gid [[threadgroup_position_in_grid]],
+    uint tid [[thread_index_in_threadgroup]],
+    uint threads [[threads_per_threadgroup]]) {
+    constexpr uint D = 128;
+    uint head = gid / args.splits;
+    uint split = gid % args.splits;
+    if (head >= args.heads || threads != 128) return;
+    uint s0 = split * args.split_rows;
+    if (s0 >= args.kv_rows) return;
+    uint s1 = min(s0 + args.split_rows, args.kv_rows);
+    uint kv_head = head / (args.heads / args.kv_heads);
+    /* Full query row staged once per group — see qw_sdpa_decode_bf16. */
+    if (tid < D) qg[tid] = h3_bf16_to_f32(query[head * D + tid]);
+    float m = -3.402823466e+38f;
+    float l = 0.0f;
+    float accv = 0.0f;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint t0 = s0; t0 < s1; t0 += TILE) {
+        uint t1 = min(t0 + TILE, s1);
+        float local_max = -3.402823466e+38f;
+        for (uint r = t0 + tid; r < t1; r += threads) {
+            device const uint4 *krow4 = (device const uint4 *)(
+                key + ((size_t)r * args.kv_heads + kv_head) * D);
+            float dot = 0.0f;
+            for (uint v4 = 0; v4 < D / 8; v4++) {
+                uint4 w = krow4[v4];
+                dot = fma(qg[v4 * 8 + 0],
+                          h3_bf16_to_f32((ushort)(w.x & 0xffffu)), dot);
+                dot = fma(qg[v4 * 8 + 1],
+                          h3_bf16_to_f32((ushort)(w.x >> 16)), dot);
+                dot = fma(qg[v4 * 8 + 2],
+                          h3_bf16_to_f32((ushort)(w.y & 0xffffu)), dot);
+                dot = fma(qg[v4 * 8 + 3],
+                          h3_bf16_to_f32((ushort)(w.y >> 16)), dot);
+                dot = fma(qg[v4 * 8 + 4],
+                          h3_bf16_to_f32((ushort)(w.z & 0xffffu)), dot);
+                dot = fma(qg[v4 * 8 + 5],
+                          h3_bf16_to_f32((ushort)(w.z >> 16)), dot);
+                dot = fma(qg[v4 * 8 + 6],
+                          h3_bf16_to_f32((ushort)(w.w & 0xffffu)), dot);
+                dot = fma(qg[v4 * 8 + 7],
+                          h3_bf16_to_f32((ushort)(w.w >> 16)), dot);
+            }
+            dot *= args.scale;
+            scores[r - t0] = dot;
+            local_max = max(local_max, dot);
+        }
+        red[tid] = local_max;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        for (uint stride = 64; stride; stride >>= 1) {
+            if (tid < stride) red[tid] = max(red[tid], red[tid + stride]);
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+        }
+        float m_tile = red[0];
+        float m_new = max(m, m_tile);
+        float corr = (m_tile == -3.402823466e+38f &&
+                      m == -3.402823466e+38f)
+                         ? 1.0f : exp(m - m_new);
+        float local_sum = 0.0f;
+        for (uint r = t0 + tid; r < t1; r += threads) {
+            float p = exp(scores[r - t0] - m_new);
+            scores[r - t0] = (float)bfloat(p); /* bf16 P for the PV pass */
+            local_sum += p; /* denominator keeps the fp32 p */
+        }
+        red[tid] = local_sum;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        for (uint stride = 64; stride; stride >>= 1) {
+            if (tid < stride) red[tid] += red[tid + stride];
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+        }
+        l = l * corr + red[0];
+        accv *= corr;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        for (uint r = t0; r < t1; r++) {
+            float p = scores[r - t0];
+            device const ushort *vrow =
+                value + ((size_t)r * args.kv_heads + kv_head) * D;
+            accv = fma(p, h3_bf16_to_f32(vrow[tid]), accv);
+        }
+        m = m_new;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    float *dst = partial + ((size_t)head * args.splits + split) * (D + 32);
+    /* [acc 128][m][l][pad] layout, m/l line filled — see the scalar
+     * split kernel comment. */
+    dst[tid] = accv;
+    if (tid < 32) {
+        if (tid == 0) dst[D] = m;
+        else if (tid == 1) dst[D + 1] = l;
+        else dst[D + tid] = 0.0f;
+    }
+}
+
+typedef decltype(qw_sdpa_dec_v_impl<128>) qw_sdpa_dec_v_t;
+template [[host_name("qw_sdpa_decode_split_v_bf16")]] kernel qw_sdpa_dec_v_t
+    qw_sdpa_dec_v_impl<128>;
+template [[host_name("qw_sdpa_decode_split_v256_bf16")]] kernel
+    qw_sdpa_dec_v_t qw_sdpa_dec_v_impl<256>;
+template [[host_name("qw_sdpa_decode_split_v512_bf16")]] kernel
+    qw_sdpa_dec_v_t qw_sdpa_dec_v_impl<512>;

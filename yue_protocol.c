@@ -81,7 +81,10 @@ static void overlay_sampling(yue_sampling *target, const yw_json *value) {
     if ((member = yw_json_get(value, "penalty_window")) &&
         yw_json_type(member) == yue_json_NUMBER) {
         int v;
-        if (json_int_in_range(yw_json_number(member), 1, 1 << 20, &v))
+        /* Keep the accepted range aligned with check_sampling()'s
+         * YUE_MAX_WINDOW gate, otherwise generation only reports a vague
+         * "invalid sampling parameters" later. */
+        if (json_int_in_range(yw_json_number(member), 1, YUE_MAX_WINDOW, &v))
             target->penalty_window = v;
     }
     if ((member = yw_json_get(value, "min_tokens")) &&
@@ -180,7 +183,9 @@ int yue_cot_index(const char *cot) {
 }
 
 double yue_request_guidance(int cot, double cfg_scale, int has_cfg_scale) {
-    if (has_cfg_scale && cfg_scale >= 0.0) return cfg_scale;
+    if (has_cfg_scale && isfinite(cfg_scale) && cfg_scale >= 0.0 &&
+        cfg_scale <= 20.0)
+        return cfg_scale;
     return cot == YUE_COT_OFF ? 1.01 : 1.0;
 }
 
@@ -296,9 +301,16 @@ static int prefixes_common(const h3_tokenizer *tokenizer, const char *style,
     } else if (abc_ids && abc_count) {
         ok = append_token(&buffer, count, &capacity, YUE_ABC_START, error,
                           error_size);
-        for (size_t i = 0; ok && i < abc_count; i++)
+        for (size_t i = 0; ok && i < abc_count; i++) {
+            if (abc_ids[i] >= YUE_EOD) {
+                if (error && error_size)
+                    snprintf(error, error_size, "abc token id out of range");
+                ok = 0;
+                break;
+            }
             ok = append_token(&buffer, count, &capacity, abc_ids[i], error,
                               error_size);
+        }
         if (ok)
             ok = append_token(&buffer, count, &capacity, YUE_ABC_END, error,
                                error_size) &&
@@ -346,7 +358,8 @@ int yue_chunk_ranges(size_t frames, size_t prefix_tokens, size_t context,
                      yue_chunk_range *out, size_t capacity, size_t *count,
                      char *error, size_t error_size) {
     *count = 0;
-    if (frames < 1 || prefix_tokens + 3 >= context) {
+    if (frames < 1 || prefix_tokens >= context ||
+        context - prefix_tokens <= 3) {
         if (error && error_size)
             snprintf(error, error_size,
                      "empty codec or prefix leaves no acoustic context");
@@ -359,15 +372,18 @@ int yue_chunk_ranges(size_t frames, size_t prefix_tokens, size_t context,
             snprintf(error, error_size, "acoustic chunk size underflow");
         return 0;
     }
-    size_t total = (frames + size - 1) / size;
+    /* Avoid frames + size - 1 (overflow) and bound the write loop by both
+     * the computed count and the caller's capacity. */
+    size_t total = frames / size + (frames % size != 0);
     if (total > capacity) {
         if (error && error_size)
             snprintf(error, error_size, "chunk range capacity too small");
         return 0;
     }
-    for (size_t index = 0, start = 0; start < frames; index++, start += size) {
+    for (size_t index = 0; index < total && index < capacity; index++) {
+        size_t start = index * size;
         out[index].start = start;
-        out[index].end = start + size < frames ? start + size : frames;
+        out[index].end = size > frames - start ? frames : start + size;
     }
     *count = total;
     return 1;

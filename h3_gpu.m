@@ -503,6 +503,8 @@ h3_gpu *h3_gpu_create(const char *shader_source_path,
             @"qw_flash2_sdpa_prefix_bf16",
             @"qw_sdpa_decode_bf16",
             @"qw_sdpa_decode_split_bf16", @"qw_sdpa_decode_merge_bf16",
+            @"qw_sdpa_decode_split_v_bf16", @"qw_sdpa_decode_split_v256_bf16",
+            @"qw_sdpa_decode_split_v512_bf16",
             @"qw_gemv_bf16", @"qw_gemv_bf16_u2", @"qw_gemv_bf16_u4",
             @"qw_gemv_bf16_u8", @"qw_gemv_bf16_c2u4",
             @"qw_gemv_bf16_g128u4", @"qw_gemv_bf16_g128c2u4",
@@ -1049,6 +1051,16 @@ int h3_gpu_continue(h3_gpu *opaque) {
     }
     if (!gpu.command) {
         h3_gpu_set_error(gpu, @"cannot continue Metal command chain");
+        /* The old buffer was already committed into inflightCommands. With
+         * no replacement buffer, h3_gpu_submit() would return immediately
+         * (it requires gpu.command) and h3_gpu_begin() would stay blocked
+         * forever on inflightCommands.count. Retire the committed work here
+         * so a failed continue does not poison the shared GPU context. */
+        @autoreleasepool {
+            for (id<MTLCommandBuffer> pending in gpu.inflightCommands)
+                [pending waitUntilCompleted];
+            [gpu.inflightCommands removeAllObjects];
+        }
         return 0;
     }
     gpu.commandStartWall = h3_gpu_now();
@@ -5935,6 +5947,7 @@ int qw_gpu_vae_avgdown_f32(h3_gpu *opaque, h3_gpu_tensor *output,
     size_t out_count = (size_t)oh * ow * out_channels;
     uint32_t factor = factor_t * 4;
     if (!oh || !ow || !height || !width || height % 2 || width % 2 ||
+        !out_channels || !factor_t || !in_channels ||
         (in_channels * factor) % out_channels ||
         !h3_gpu_require_elements(gpu, input, in_count,
                                  @"VAE avgdown input") ||
@@ -6054,6 +6067,10 @@ int qw_gpu_vae_conv_mm_f32(h3_gpu *opaque, h3_gpu_tensor *output,
                                  (size_t)height * width * out_channels,
                                  @"VAE conv-mm output") ||
         TENSOR(output).dtype != H3_GPU_F32 ||
+        (bias &&
+         (!h3_gpu_require_elements(gpu, bias, out_channels,
+                                   @"VAE conv-mm bias") ||
+          TENSOR(bias).dtype != H3_GPU_F32)) ||
         !h3_gpu_require_command(gpu)) return 0;
     int arena_ok = pad_arena &&
         h3_gpu_require_elements(gpu, pad_arena, pad_count,
@@ -6104,6 +6121,16 @@ int qw_gpu_vae_conv_repack_f32(h3_gpu *opaque, h3_gpu_tensor *w9,
                                const h3_gpu_tensor *w, uint32_t in_channels,
                                uint32_t out_channels, uint32_t out_pad) {
     H3GPU *gpu = GPU(opaque);
+    size_t total = (size_t)9 * out_pad * in_channels;
+    if (!in_channels || !out_channels || !out_pad ||
+        out_pad < out_channels ||
+        !h3_gpu_require_elements(gpu, w9, total,
+                                 @"VAE conv repack output") ||
+        TENSOR(w9).dtype != H3_GPU_F32 ||
+        !h3_gpu_require_elements(gpu, w,
+                                 (size_t)9 * out_channels * in_channels,
+                                 @"VAE conv repack input") ||
+        TENSOR(w).dtype != H3_GPU_F32) return 0;
     id<MTLComputePipelineState> pipeline =
         h3_gpu_pipeline(gpu, @"qw_vae_conv_repack_f32");
     if (!pipeline) return 0;
@@ -6111,7 +6138,6 @@ int qw_gpu_vae_conv_repack_f32(h3_gpu *opaque, h3_gpu_tensor *w9,
     struct { uint32_t ci, co, co_pad, unused; } args = {in_channels,
                                                         out_channels, out_pad,
                                                         0u};
-    size_t total = (size_t)9 * out_pad * in_channels;
     @autoreleasepool {
         id<MTLComputeCommandEncoder> encoder =
             [gpu.command computeCommandEncoder];
@@ -6238,6 +6264,7 @@ int yv_gpu_tanh_f32(h3_gpu *opaque, h3_gpu_tensor *output,
         ^(id<MTLComputeCommandEncoder> encoder) {
             [encoder setBuffer:TENSOR(input).buffer offset:0 atIndex:0];
             [encoder setBuffer:TENSOR(output).buffer offset:0 atIndex:1];
+            [encoder setBytes:&count length:sizeof(count) atIndex:2];
         });
 }
 
@@ -6582,7 +6609,7 @@ int qw_gpu_tops_gemv_bf16(h3_gpu *opaque, h3_gpu_tensor *output,
 }
 
 /* Split-K decode SDPA (q_rows == 1): phase 1 writes per-slab partials
- * into `partial` (caller scratch, >= heads*splits*130 fp32, shared
+ * into `partial` (caller scratch, >= heads*splits*(head_dim+32) fp32, shared
  * storage), phase 2 merges them. splits is derived here from kv_rows
  * (256-row slabs, clamped to max_splits); the merge needs an ordered
  * view of the partials, so the two phases are separate dispatches on
@@ -6607,6 +6634,12 @@ int qw_gpu_sdpa_decode_split_bf16(h3_gpu *opaque, h3_gpu_tensor *output,
         return 0;
     }
     uint32_t splits = (kv_rows + 255u) / 256u;
+    /* Store-loss guard (probe V, M18): single-float partial stores
+     * were lost by the memory system above ~400 concurrent groups.
+     * Cap the grid at 16 splits x 16 heads = 256 groups, observed
+     * clean across every probe V run (ms<=16 never drifted, with the
+     * [m][l][acc] cache-line-full layout layered on top). */
+    if (splits > 16u) splits = 16u;
     if (splits > max_splits) splits = max_splits;
     uint32_t split_rows = (kv_rows + splits - 1u) / splits;
     /* Invariant guard: the LAST split must own at least one row, else its
@@ -6630,7 +6663,7 @@ int qw_gpu_sdpa_decode_split_bf16(h3_gpu *opaque, h3_gpu_tensor *output,
         !h3_gpu_require_bf16(gpu, output, (size_t)heads * head_dim,
                              @"split SDPA output") ||
         !h3_gpu_require_elements(gpu, partial,
-                                 (size_t)heads * splits * (head_dim + 2),
+                                 (size_t)heads * splits * (head_dim + 32),
                                  @"split SDPA partial") ||
         TENSOR(partial).dtype != H3_GPU_F32 ||
         !h3_gpu_require_command(gpu)) return 0;
@@ -6692,6 +6725,12 @@ int qw_gpu_sdpa_decode_split_bf16_off(h3_gpu *opaque, h3_gpu_tensor *output,
         return 0;
     }
     uint32_t splits = (kv_rows + 255u) / 256u;
+    /* Store-loss guard (probe V, M18): single-float partial stores
+     * were lost by the memory system above ~400 concurrent groups.
+     * Cap the grid at 16 splits x 16 heads = 256 groups, observed
+     * clean across every probe V run (ms<=16 never drifted, with the
+     * [m][l][acc] cache-line-full layout layered on top). */
+    if (splits > 16u) splits = 16u;
     if (splits > max_splits) splits = max_splits;
     uint32_t split_rows = (kv_rows + splits - 1u) / splits;
     if (!kv_rows || split_rows == 0 ||
@@ -6713,7 +6752,7 @@ int qw_gpu_sdpa_decode_split_bf16_off(h3_gpu *opaque, h3_gpu_tensor *output,
                              output_offset + (size_t)heads * head_dim,
                              @"split SDPA output") ||
         !h3_gpu_require_elements(gpu, partial,
-                                 (size_t)heads * splits * (head_dim + 2),
+                                 (size_t)heads * splits * (head_dim + 32),
                                  @"split SDPA partial") ||
         TENSOR(partial).dtype != H3_GPU_F32 ||
         !h3_gpu_require_command(gpu)) return 0;
@@ -6745,6 +6784,97 @@ int qw_gpu_sdpa_decode_split_bf16_off(h3_gpu *opaque, h3_gpu_tensor *output,
         [encoder setComputePipelineState:p2];
         [encoder setBuffer:TENSOR(partial).buffer offset:0 atIndex:0];
         [encoder setBuffer:TENSOR(output).buffer offset:o_bytes atIndex:1];
+        [encoder setBytes:&args length:sizeof(args) atIndex:2];
+        [encoder dispatchThreadgroups:MTLSizeMake(heads, 1, 1)
+                 threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
+        [encoder endEncoding];
+    }
+    h3_gpu_stats stats = gpu.stats;
+    stats.direct_dispatches += 2;
+    gpu.stats = stats;
+    return 1;
+}
+
+/* Vectorized split decode SDPA (M18): identical contract and validation
+ * to qw_gpu_sdpa_decode_split_bf16, but the K-row scoring kernel loads
+ * rows as uint4 (qw_sdpa_dec_v_impl). `tile` selects the smem scores
+ * tile and hence the pipeline (128 = bit-exact with the scalar kernel,
+ * 256/512 = larger tiles, order difference as documented on the kernel).
+ * The merge kernel and partial layout are shared with the scalar split
+ * path. max_splits semantics unchanged. */
+int qw_gpu_sdpa_decode_split_v_bf16(h3_gpu *opaque, h3_gpu_tensor *output,
+                                    const h3_gpu_tensor *query,
+                                    const h3_gpu_tensor *key,
+                                    const h3_gpu_tensor *value,
+                                    uint32_t kv_rows, uint32_t heads,
+                                    uint32_t kv_heads, uint32_t head_dim,
+                                    float scale, h3_gpu_tensor *partial,
+                                    uint32_t max_splits, uint32_t tile) {
+    H3GPU *gpu = GPU(opaque);
+    if (head_dim != 128 || !heads || !kv_heads || heads % kv_heads ||
+        !max_splits || (tile != 128 && tile != 256 && tile != 512)) {
+        h3_gpu_set_error(gpu, @"split SDPA v: unsupported geometry");
+        return 0;
+    }
+    uint32_t splits = (kv_rows + 255u) / 256u;
+    /* Store-loss guard (probe V, M18): single-float partial stores
+     * were lost by the memory system above ~400 concurrent groups.
+     * Cap the grid at 16 splits x 16 heads = 256 groups, observed
+     * clean across every probe V run (ms<=16 never drifted, with the
+     * [m][l][acc] cache-line-full layout layered on top). */
+    if (splits > 16u) splits = 16u;
+    if (splits > max_splits) splits = max_splits;
+    uint32_t split_rows = (kv_rows + splits - 1u) / splits;
+    if (!kv_rows || split_rows == 0 ||
+        (splits - 1u) * split_rows >= kv_rows) {
+        h3_gpu_set_error(gpu, @"split SDPA v: split derivation leaves an "
+                               "unwritten partial slot");
+        return 0;
+    }
+    if (!kv_rows ||
+        !h3_gpu_require_bf16(gpu, query, (size_t)heads * head_dim,
+                             @"split SDPA v query") ||
+        !h3_gpu_require_bf16(gpu, key, (size_t)kv_rows * kv_heads * head_dim,
+                             @"split SDPA v key") ||
+        !h3_gpu_require_bf16(gpu, value,
+                             (size_t)kv_rows * kv_heads * head_dim,
+                             @"split SDPA v value") ||
+        !h3_gpu_require_bf16(gpu, output, (size_t)heads * head_dim,
+                             @"split SDPA v output") ||
+        !h3_gpu_require_elements(gpu, partial,
+                                 (size_t)heads * splits * (head_dim + 32),
+                                 @"split SDPA v partial") ||
+        TENSOR(partial).dtype != H3_GPU_F32 ||
+        !h3_gpu_require_command(gpu)) return 0;
+    struct {
+        uint32_t kv_rows, heads, kv_heads, splits, split_rows;
+        float scale;
+    } args = {kv_rows, heads, kv_heads, splits, split_rows, scale};
+    NSString *name = tile <= 128 ? @"qw_sdpa_decode_split_v_bf16"
+                     : tile <= 256 ? @"qw_sdpa_decode_split_v256_bf16"
+                                   : @"qw_sdpa_decode_split_v512_bf16";
+    id<MTLComputePipelineState> p1 = h3_gpu_pipeline(gpu, name);
+    id<MTLComputePipelineState> p2 =
+        h3_gpu_pipeline(gpu, @"qw_sdpa_decode_merge_bf16");
+    if (!p1 || !p2) return 0;
+    @autoreleasepool {
+        id<MTLComputeCommandEncoder> encoder =
+            [gpu.command computeCommandEncoder];
+        [encoder setComputePipelineState:p1];
+        [encoder setBuffer:TENSOR(query).buffer offset:0 atIndex:0];
+        [encoder setBuffer:TENSOR(key).buffer offset:0 atIndex:1];
+        [encoder setBuffer:TENSOR(value).buffer offset:0 atIndex:2];
+        [encoder setBuffer:TENSOR(partial).buffer offset:0 atIndex:3];
+        [encoder setBytes:&args length:sizeof(args) atIndex:4];
+        [encoder setThreadgroupMemoryLength:tile * sizeof(float)
+                                    atIndex:0];
+        [encoder setThreadgroupMemoryLength:128 * sizeof(float) atIndex:1];
+        [encoder setThreadgroupMemoryLength:128 * sizeof(float) atIndex:2];
+        [encoder dispatchThreadgroups:MTLSizeMake(heads * splits, 1, 1)
+                 threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
+        [encoder setComputePipelineState:p2];
+        [encoder setBuffer:TENSOR(partial).buffer offset:0 atIndex:0];
+        [encoder setBuffer:TENSOR(output).buffer offset:0 atIndex:1];
         [encoder setBytes:&args length:sizeof(args) atIndex:2];
         [encoder dispatchThreadgroups:MTLSizeMake(heads, 1, 1)
                  threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];

@@ -1,6 +1,6 @@
 # yue-metal — Native Metal Inference Engine for YuE2-3B
 
-中文文档：[README-ZH.md](README-ZH.md)
+English | [简体中文](README-ZH.md)
 
 A native inference engine for the YuE2-3B song-generation model (AR semantic
 tokens + NAR acoustic flow matching + Oobleck VAE), written in plain C11 +
@@ -41,7 +41,10 @@ per-milestone same-request A/Bs; same for RTF):
 Cumulative: semantic **≈6.3×**, e2e RTF **≈2.9×**. The scheduling track (M12),
 the GEMM kernel track (M13), and the encoding/host track (M14) are all closed —
 verdicts and data for each step are in the performance section and in the
-header comment of `tests/bench_dispatch.c`.
+header comment of `tests/bench_dispatch.c`. M18 (2026-11-05) is a correctness
+fix for the long-KV split-K SDPA path (full cacheline writes + 16-split cap);
+it leaves the table above unchanged (only the kv>4096 attention range costs
+10-20% more) — see the performance section.
 
 Historical: M10 (321-char request profile) semantic 19.9 ms/token, RTF 0.80
 (lyra same profile ≈17.1/0.73); M7 four rounds 34.2s (RTF 1.15) → M8 VAE GPU
@@ -235,6 +238,44 @@ REPL commands:
   (1.91×), e2e 99.8 → 56.1s, RTF 1.24 → 0.80; per-token GPU busy 48.5 →
   31.2ms, per-token submissions 56.1/56.2 unchanged (command-chain rhythm
   unchanged; purely a GPU-side win). `YUE_SDPA_FLASH2=1` falls back to flash2.
+- **M18: split-K SDPA correctness fix + vectorized-rewrite verdict**
+  (2026-11-05). The vectorization attempt (uint4 K loads + TILE templates,
+  `qw_sdpa_dec_v_impl`, probe U v128/256/512) showed **no meaningful
+  headroom**: v128 is bit-identical to the scalar kernel and equally fast
+  (load-instruction count is not the bottleneck), v256/512 win only 2-3% at
+  medium kv and lose 5-20% at large kv — the projected 263→500GB/s never
+  materialized. The kernel is kept as probe infrastructure and is not used in
+  production. **The real result came from probe V
+  (`./tests/bench_dispatch V`), which exposed a latent correctness bug**:
+  `ceil(kv/256)` lets the split count exceed ~400 groups at kv>6144 rows, and
+  the partial's single 4-byte store (m/l) can be probabilistically lost by the
+  memory system — the readback is **the previous dispatch's value** (probe V
+  R11: with K=0, among mathematically constant quantities, l occasionally
+  shows a historical value from the V=0 experiment; atomic stores,
+  whole-group same-value writes, and writing a full cacheline alone did not
+  fix it, while the 128-thread contiguous acc write never failed). This
+  corrupted decode attention in the second half of long songs (the semantic
+  cache tops out near prefix+9000), latent since M10 because fixtures only
+  covered kv≤55 plus a few steps. **Two-layer fix**: ① the slot layout stays
+  `[acc 128][m][l]` but the stride goes 130→**160 floats** (640 B,
+  cacheline-aligned) and the m/l cacheline is written full (tid<32: tid0/1
+  write m/l, tid2-31 write zero padding) — the lonely 4-byte store becomes
+  32 same-line stores; the `[m][l][acc]` layout was **not adopted** (an 8 B
+  acc start offset would straddle 5 lines). ② The splits cap went 384→**256
+  groups** (16 splits, hard cap in the wrapper; the loss rate rises steeply
+  with group count, and ≤256 groups showed zero losses across all probe V
+  runs). Cost accounting (probe U control: cap38 + new layout 146µs@9500 is
+  in the same band as before → the layout is free; the earlier 46.3µs@2048
+  was a cold-boost outlier, warm steady state 49.5-50.5 in band): the only
+  confirmed cost is cap16's large-kv range — kv=9500 about 146→160-180µs
+  (+10-20%, ≈0.9 ms/token over 28 layers × 2 branches, only for kv>4096;
+  kv≤4096 is unaffected). The probe V matrix (R1-R12) preserves the
+  diagnosis; a residual observation (probe-only CPU `write_bf16` / GPU
+  dispatch interleaving — production KV caches are written entirely in the
+  GPU domain via blit/kernel, never by the CPU) was not pursued. End-to-end
+  serve: 4373 tok and **7052 tok (kv~7100, fixed path)** long songs done ✓,
+  FLAC 24bit/48k/stereo ✓; all seven regression suites green (melody_abc
+  gate intact).
 - semantic dual-branch 28.6ms/token (14.3ms/branch-token, M8 profile, old
   request); [gpu] encode 3.1s / wait 24.4s / busy 27.2s / submissions 43K;
   memory live ~7.7GB, footprint ~9.6GB.
@@ -349,22 +390,24 @@ Seven regression suites (all pass with `0 failure(s)`): `m0` (smoke),
 `tokenizer` (tiktoken bit-exact), `gemv` (k-mapping + bit-level comparison +
 fused qkv), `ar` (prefill/step parity vs lyra fixtures), `sampling` (11 unit
 cases + melody_abc/semantic greedy e2e), `nar` (conditioning cache / velocity
-/ solver / multi-chunk), `vae` (67 stages + audio comparison; decode runs on
-the GPU path by default, auto-falls back to CPU with a notice if Metal is
-unavailable, `YUE_VAE_CPU=1` forces CPU).
+/ solver / multi-chunk), `vae` (67 stages + audio comparison; decode uses the
+GPU path by default and silently falls back to CPU when Metal is unavailable;
+`YUE_VAE_CPU=1` forces the CPU path).
 
 Fixture generation (needs the reference-stack venv): `make tokenizer-fixture
-ar-fixture sampling-fixture nar-fixture vae-fixture`. Micro-benchmarks:
+ar-fixture sampling-fixture nar-fixture vae-fixture` (nar-fixture needs
+`LYRA_FORCE_BF16_SDPA=1`). The `tests/gen_*_fixture.py` scripts still point at
+the retired lyra conversion directory; the shipped `.npy/.json` fixtures are
+self-contained, and regenerating them requires re-running the lyra conversion
+from the official weights first. Micro-benchmarks:
 `make bench-gemv bench-dispatch`; `./tests/bench_dispatch F` runs probe F
 only (the production-rhythm decode chain: true dependencies + layer-tail
-continue + CFG dual branches + 2048-step thermal soak — the sole probe
-arbiter of kernel quality, conclusions in the file header comment; `G` =
+continue + CFG dual branches + 2048-step thermal soak — the main probe
+arbiter for kernel quality, conclusions in the file header comment; `G` =
 per-shape true-dependency bandwidth calibration; `T`/`U`/`S` = timeline
-ablation / SDPA micro-benchmark / 2D sweep).
-
-Note: this repository ships the small fixtures (`tokenizer/ar/sampling/nar`);
-`tests/vae_fixture` (~1.4GB) is not distributed — regenerate it with
-`make vae-fixture`.
+ablation / SDPA microbenchmark / 2D sweep; `V` = the M18 split-K partial
+write-loss matrix (R1-R12); `H` = the rows=2 bit-exactness / efficiency gate
+for CFG batch fusion).
 
 ## Architecture Map
 
@@ -387,7 +430,9 @@ performance rounds (four) → M8 VAE GPU + GEMV mystery closed → M9 MLX-style
 attention prologue fusion → M12 graph-capture verdict (scheduling closed) →
 M13 GEMM track final review (full-fan + per-shape calibration, kernels
 closed) → M14 host-tail attribution fix + decode GEMV switched to the 2D
-block kernel → M15 CFG batch fusion (semantic −40%, overtakes lyra).
+block kernel → M15 CFG batch fusion (semantic −40%, overtakes lyra) → M18
+split-K SDPA long-KV correctness fix (full cacheline writes + 16-split cap;
+the vectorized rewrite was judged to bring no gain).
 M16/M17 once implemented `--precision 8bit` (lyra ar-8bit weights + int8
 GEMV); measured to save memory only, not speed (slightly slower, ~4%); it
 has been removed entirely.
@@ -420,7 +465,8 @@ has been removed entirely.
   entirely from "shape drift × driver pool" (Metal freed pages are never
   returned to the OS; the driver pool reuses by exact size). Five layers of
   mitigation are in place: ① KV cache / NAR chunk capacities bucketed to
-  512-row multiples (`YUE_SHAPE_BUCKET`); ② VAE halo-tile last-block start
+  512-row multiples (`YUE_SHAPE_BUCKET` is a compile-time constant in
+  `yue.h`, not an environment variable); ② VAE halo-tile last-block start
   pull-back (each tile's input converges to {core+halo, core+2*halo};
   overlap regions decode twice to the same value thanks to the halo —
   bit-identical); **③ prefill row-count bucketing** (`yue_ar_forward` pads
@@ -451,8 +497,13 @@ has been removed entirely.
   MPS rows=1 GEMM has 1-ulp run-to-run nondeterminism that chaotic decoding
   amplifies into shape drift, hence the five-layer mitigation + self-restart
   backstop).
-- Apple Silicon only; the weights directory must follow lyra's conversion
-  layout rules (no symlinks, manifest tolerates zero extra files, ar-bf16 /
-  nar-bf16 required).
+- Apple Silicon only, and effectively M5-series: TensorOps kernels are enabled
+  by device name; on non-M5 chips or with `H3_NAX=0`, the pipeline list and the
+  shader's conditional compilation disagree and engine creation fails (known
+  platform limitation). The preferred weights layout is the official single-file
+  directory (`YuE2-3B/model.safetensors` + `YuE2-Vae`), which has no lyra
+  conversion constraints; only the legacy lyra layout (`ar-bf16`/`nar-bf16`)
+  requires its directory rules (no symlinks, manifest tolerates zero extra
+  files, both weight files required).
 - Not a git-tracked development tree here; vendored `linenoise.c` carries 30
   legacy compile warnings (own code compiles warning-free).

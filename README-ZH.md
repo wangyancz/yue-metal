@@ -1,6 +1,6 @@
 # yue-metal — YuE2-3B 原生 Metal 推理引擎
 
-English documentation: [README.md](README.md)
+[English](README.md) | 简体中文
 
 YuE2-3B 歌曲生成模型（AR 语义 token + NAR 声学流匹配 + Oobleck VAE）的原生推理引擎，
 纯 C11 + Objective-C/Metal，面向 Apple Silicon（M 系统一体内存）。数值约定逐点复刻
@@ -35,7 +35,9 @@ GEMM 的权重流从两遍并成一遍（见性能节）；flow 侧 yue 的 NAR/
 
 累计：semantic **≈6.3×**、e2e RTF **≈2.9×**。调度侧（M12）、GEMM 内核
 （M13）、编码/宿主（M14）已封盘——每一步的裁决与数据见性能节与
-`tests/bench_dispatch.c` 头注释。
+`tests/bench_dispatch.c` 头注释。M18（2026-11-05）为 split-K SDPA 长 KV
+段的正确性修复（cacheline 写满 + splits cap 16），不改变上表性能（仅
+kv>4096 区间的注意力耗时 +10-20%），详见性能节。
 
 历史版本：M10（321 字请求画像）semantic 19.9 ms/token、RTF 0.80（lyra
 同口径 ≈17.1/0.73）；M7 四轮 34.2s（RTF 1.15）→ M8 VAE GPU 化 28.8s
@@ -50,7 +52,8 @@ GEMM 的权重流从两遍并成一遍（见性能节）；flow 侧 yue 的 NAR/
   的目录（权重与官方单文件字节级一致，全 628 张量 sha256 验证；缺 ar-bf16/
   nar-bf16 时自动回退到单文件），VAE 键/形状/dtype 与官方完全同构。
   官方目录自带 `yue2_generation_config.json`（与内置默认逐字段一致）。
-- 参考栈：`/Volumes/Work/mlx-Yue`（lyra MLX 包 + 其 `.venv`，仅测试 fixture 生成时使用）。
+- 参考栈：`/Volumes/Work/mlx-Yue`（lyra MLX 包 + 其 `.venv`，仅测试 fixture 生成时使用；
+  fixture 的 `.npy/.json` 已固化在 tests/ 下，重跑生成脚本需先用官方权重重做 lyra 转换）。
 - 运行依赖：Metal、MetalPerformanceShaders(+Graph)、Accelerate、ffmpeg（FLAC 转码，PATH 中可用）。
 
 ## 构建
@@ -188,6 +191,33 @@ REPL 指令：
   semantic 38.1 → **19.9 ms/token**（1.91×），e2e 99.8 → 56.1s，RTF 1.24 →
   0.80；per-token GPU busy 48.5 → 31.2ms，per-token submissions 56.1/56.2 持平
   （命令链节奏不变，纯 GPU 侧收益）。`YUE_SDPA_FLASH2=1` 回退 flash2。
+- **M18：split SDPA 存量正确性修复 + 向量化重写裁决**（2026-11-05）。向量化
+  尝试（uint4 K 加载 + TILE 模板化，`qw_sdpa_dec_v_impl`，probe U v128/256/512）
+  的实测结论是**无可观收益空间**：v128 与标量逐位一致且同速（瓶颈不是 load
+  指令数），v256/512 仅中 kv 赢 2-3%、大 kv 反慢 5-20%——当初评估的
+  263→500GB/s 未兑现，内核保留为 probe 基建、生产不切换。**真正的产出是
+  probe V（`./tests/bench_dispatch V`）挖出的存量 bug**：split 推导
+  `ceil(kv/256)` 在 kv>6144 行时并发组数超 ~400，partial 的单笔 4B store
+  （m/l）被内存系统概率性丢失——读回的是**上一次 dispatch 的值**（probe V
+  R11：K=0 下全部数学恒定的量中 l 偶现 V=0 实验的历史值；atomic store、
+  全组同值写、写满 cacheline 均无法根治，acc 的 128 线程连续写从不丢）。
+  这使 kv>6144 的长歌（semantic cache 上限 ~prefix+9000）后半段 decode
+  注意力输出错误，M10 落地以来潜伏（fixture 只覆盖 kv≤55+几步）。**两层
+  修复**：①槽布局保持 `[acc 128][m][l]`，stride 130→**160 floats**
+  （640B = cacheline 对齐），并把 m/l 所在 cacheline 写满（tid<32：tid0/1
+  写 m/l、tid2-31 写 0 填充）——孤立 4B store 变成 32 笔同线写；
+  **未采用** `[m][l][acc]` 布局（acc 起始偏移 8B 会跨 5 行写）；
+  ②splits cap 384→**256 组**（16 splits，wrapper 硬 cap；丢弃
+  率随组数陡增，≤256 组跨全部 probe V 运行零丢失）。代价核算（probe U
+  对照：cap38+新布局 146µs@9500 与修复前同带 → 布局零代价；修复前
+  46.3µs@2048 是冷 boost 孤值，热态常态 49.5-50.5 同带）：唯一确定代价是
+  cap16 的大 kv 段——kv=9500 约 146→160-180µs（+10-20%，28 层×2 分支
+  ≈0.9ms/token，仅 kv>4096 区间；kv≤4096 不受影响）。
+  probe V 矩阵（R1-R12）固化诊断过程；残留观察：CPU `write_bf16` 与 GPU
+  dispatch 交错场景（probe 特有，生产 KV cache 全程 GPU 域 blit/kernel
+  写入不经 CPU）首跑可见固定差异，疑同类丢失的 CPU→GPU 面，未深究。
+  serve 端到端：4373 tok 与 **7052 tok（kv~7100，修复路径）**长歌 done ✓
+  FLAC 24bit/48k/stereo ✓，七套回归全绿（melody_abc 门保持）。
 - semantic 双分支 28.6ms/token（14.3ms/branch-token，M8 口径、旧请求画像）；
   [gpu] encode 3.1s / wait 24.4s / busy 27.2s / submissions 43K；内存 live
   ~7.7GB、footprint ~9.6GB。
@@ -278,15 +308,16 @@ REPL 指令：
 `gemv`（k-映射 + 位级对拍 + qkv 融合）、`ar`（prefill/step parity vs lyra fixture）、
 `sampling`（11 单元 case + melody_abc/semantic 贪心 e2e）、`nar`（条件缓存/velocity/
 solver/多 chunk）、`vae`（67 阶段 + 音频对拍；默认走 GPU 解码路径，Metal 不可用时
-自动回退 CPU 并打印提示，`YUE_VAE_CPU=1` 强制 CPU）。
+静默回退 CPU（无额外日志），`YUE_VAE_CPU=1` 强制 CPU）。
 
 fixture 生成（需参考栈 venv）：`make tokenizer-fixture ar-fixture
 sampling-fixture nar-fixture vae-fixture`（nar-fixture 需
 `LYRA_FORCE_BF16_SDPA=1`）。微基准：`make bench-gemv bench-dispatch`；
 `./tests/bench_dispatch F` 只跑
 probe F（生产节奏 decode 链：真依赖 + 层尾 continue + CFG 双分支 + 2048 步热态，
-kernel 优劣的唯一 probe 裁据，结论见文件头注释；`G` = 按形状真依赖带宽校准，
-`T`/`U`/`S` = 时间线消融 / SDPA 微基准 / 2D sweep）。
+kernel 优劣的主要 probe 裁据，结论见文件头注释；`G` = 按形状真依赖带宽校准，
+`T`/`U`/`S` = 时间线消融 / SDPA 微基准 / 2D sweep，`V` = M18 split-K
+partial 写丢失矩阵（R1-R12），`H` = CFG batch fusion 的 rows=2 位级/效率门）。
 
 ## 架构地图
 
@@ -308,7 +339,8 @@ M5 VAE+FLAC → M6 serve/REPL 全管线 → M7 性能轮（四轮）→ M8 VAE G
 M11 attention prologue 融合 → M12 图捕获裁决（调度封盘）→ M13 GEMM 赛道终审
 （满风扇+分档校准，内核封盘）→ M14 宿主尾归因修正 + decode GEMV 默认切 2D
 块内核 → M15 CFG batch fusion（semantic −40%，
-反超 lyra）。M16/M17 曾实现 `--precision 8bit`（lyra ar-8bit 权重 + int8
+反超 lyra）→ M18 split-K SDPA 正确性修复（cacheline 写满 + splits cap 16，
+向量化重写裁决无收益）。M16/M17 曾实现 `--precision 8bit`（lyra ar-8bit 权重 + int8
 GEMV），实测仅省内存不提速（略慢 ~4%），已整体移除。
 
 ## 已知限制
@@ -331,7 +363,7 @@ GEMV），实测仅省内存不提速（略慢 ~4%），已整体移除。
   平台、`MallocStackLogging` 下 `leaks` = 0——无泄漏；footprint 棘轮全部来自
   「形状漂移 × 驱动池」（Metal freed 页不还 OS，驱动池按精确大小复用）。
   已落地五层缓解：①KV cache / NAR chunk 容量按 512 行桶化
-  （`YUE_SHAPE_BUCKET`）；②VAE halo tile 的最后一块起点回退（每 tile 输入
+  （`YUE_SHAPE_BUCKET` 为 `yue.h` 编译期常量，非环境变量）；②VAE halo tile 的最后一块起点回退（每 tile 输入
   收敛到 {core+halo, core+2*halo}，重叠区由 halo 保证两次解码同值，逐位
   不变）；**③prefill 行数桶化**（`yue_ar_forward` 对 count>1 的前向 pad 到
   512 行倍、行尾填 token 0——因果 limit 下真实行逐位不变，decode count==1
@@ -352,6 +384,9 @@ GEMV），实测仅省内存不提速（略慢 ~4%），已整体移除。
   连发 footprint 恒 ~7.55GB（`mx.clear_cache()` 用户态池显式归还 + 逐 kernel
   确定性执行、形状空间稳定；native 的 MPS rows=1 GEMM 有 1-ulp 运行间非确定性，
   混沌解码放大成形状漂移，故需上述五层缓解 + 自重启兜底）。
-- 仅 Apple Silicon；权重目录布局需符合 lyra 转换目录铁律（无 symlink、manifest
-  零容忍多余文件、ar-bf16/nar-bf16 必需）。
+- 仅 Apple Silicon，且需 M5 系列：TensorOps 内核按设备名启用，非 M5 或 `H3_NAX=0`
+  时 pipeline 名单与 shader 条件编译不一致，引擎会创建失败（已知平台限制）。
+  权重优先直读官方单文件目录（`YuE2-3B/model.safetensors` + `YuE2-Vae`），
+  不受 lyra 转换目录约束；仅当使用旧 lyra 布局（`ar-bf16`/`nar-bf16`）时才需
+  遵守其目录铁律（无 symlink、manifest 零容忍多余文件、两个必需权重文件）。
 - 非 git 仓库；vendored `linenoise.c` 存在 30 条历史遗留编译警告（自研代码零警告）。

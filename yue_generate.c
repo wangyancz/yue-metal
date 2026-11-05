@@ -45,13 +45,20 @@ void yue_generation_free(yue_generation *gen) {
  * every range comparison, so the finite checks are explicit. */
 static int check_sampling(const yue_sampling *sp, char *error,
                           size_t error_size) {
+    const float temp_f = (float)sp->temperature;
+    const float penalty_f = (float)sp->repetition_penalty;
     if (!isfinite(sp->temperature) || !isfinite(sp->top_p) ||
         !isfinite(sp->repetition_penalty) ||
         sp->temperature < 0.0 || sp->temperature > 5.0 ||
         sp->top_p <= 0.0 || sp->top_p > 1.0 || sp->top_k < 1 ||
         sp->repetition_penalty <= 0.0 || sp->penalty_window < 1 ||
         sp->penalty_window > YUE_MAX_WINDOW || sp->min_tokens < 0 ||
-        sp->min_tokens > sp->max_tokens || sp->max_tokens < 1) {
+        sp->min_tokens > sp->max_tokens || sp->max_tokens < 1 ||
+        /* double values can underflow/overflow when cast to float: a
+         * 1e-300 temperature would divide by zero, a 1e308 penalty
+         * would become inf. Reject those at the boundary. */
+        !isfinite(temp_f) || temp_f < 0.0f ||
+        !isfinite(penalty_f) || penalty_f <= 0.0f) {
         set_error(error, error_size, "invalid sampling parameters");
         return 0;
     }
@@ -91,7 +98,16 @@ static int project_last_row(yue_ar *ar, const h3_gpu_tensor *hidden,
                                    b->logits, error, error_size);
     if (opened && !ok) h3_gpu_submit(yue_ar_gpu(ar)); /* drain: copy failed */
     h3_gpu_tensor_free(last);
-    if (!ok) return 0;
+    if (!ok) {
+        /* The GPU helpers above do not all write an error (a failed
+         * h3_gpu_begin/copy/submit returns 0 silently). Keep the caller's
+         * more specific message if one was already set. */
+        if (error && error_size && !error[0])
+            set_error(error, error_size,
+                      "prefill logits projection failed: %s",
+                      h3_gpu_error(yue_ar_gpu(ar)));
+        return 0;
+    }
     return h3_gpu_tensor_read_bf16(b->logits, b->host, b->width);
 }
 
@@ -240,6 +256,16 @@ int yue_ar_generate(yue_ar *ar, const uint32_t *prefix, size_t prefix_len,
         set_error(error, error_size, "invalid generate arguments");
         return 0;
     }
+    if (phase != YUE_PHASE_ABC && phase != YUE_PHASE_SEMANTIC) {
+        set_error(error, error_size, "invalid generation phase");
+        return 0;
+    }
+    if (!isfinite(cfg_scale) || cfg_scale < 0.0 || cfg_scale > 20.0 ||
+        (phase == YUE_PHASE_ABC && cfg_scale != 1.0)) {
+        set_error(error, error_size,
+                  "invalid CFG scale (ABC phase requires no guidance)");
+        return 0;
+    }
     /* Validate before the length checks: a negative max_tokens wraps its
      * size_t casts, so the context arithmetic below would misreport. */
     if (!check_sampling(sp, error, error_size)) return 0;
@@ -386,7 +412,8 @@ int yue_ar_generate(yue_ar *ar, const uint32_t *prefix, size_t prefix_len,
         double h2 = ht.on ? ht_now() : 0;
         if (!yue_distribution(scores, pos.width, phase, sp, gen->tokens,
                               gen->count, step, legacy)) {
-            set_error(error, error_size, "out of memory (sampling filters)");
+            set_error(error, error_size,
+                      "invalid distribution parameters or out of memory");
             ok = 0;
             goto fail;
         }
@@ -410,7 +437,7 @@ int yue_ar_generate(yue_ar *ar, const uint32_t *prefix, size_t prefix_len,
             }
             local = -1;
             for (size_t i = 0; i < pos.width; i++)
-                if (scores[i] == scores[i] &&
+                if (isfinite(scores[i]) &&
                     (local < 0 || scores[i] > scores[local])) local = (int)i;
             /* Greedy diagnostic: margin between the top-2 candidates. Two
              * bf16 implementations flip argmax on near-ties (within the
@@ -418,8 +445,7 @@ int yue_ar_generate(yue_ar *ar, const uint32_t *prefix, size_t prefix_len,
              * only at small margins. */
             int second = -1;
             for (size_t i = 0; i < pos.width; i++)
-                if ((int)i != local && scores[i] != -INFINITY &&
-                    scores[i] == scores[i] &&
+                if ((int)i != local && isfinite(scores[i]) &&
                     (second < 0 || scores[i] > scores[second]))
                     second = (int)i;
             double margin = second >= 0

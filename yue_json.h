@@ -20,7 +20,8 @@ typedef enum {
 
 typedef struct yw_json yw_json;
 
-/* Parse NUL-terminated text. Returns 0 and fills *out on success. */
+/* Parse NUL-terminated text. Returns 1 and fills *out on success,
+ * 0 on failure (with *out set to NULL). */
 int yw_json_parse(const char *text, yw_json **out, char *error,
                   size_t error_size);
 void yw_json_free(yw_json *value);
