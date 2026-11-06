@@ -8,12 +8,16 @@
  *   VAE decode (halo tiles) -> 24-bit WAV -> ffmpeg FLAC.
  *
  * Serve protocol (mirrors tools/yue2-web/worker.py): requests
- * {"id","style","lyrics","cot","cfgScale","seed","output"} produce
+ * {"id","style","lyrics","cot","cfgScale","seed","output","abc"} produce
  * state loading/ready, progress (stage abc|semantic|flow|save with
  * percent spans 0.02-0.38 / 0.40-0.78 / 0.80-0.94 / 0.96-1.00, 4 s
  * heartbeats that never refresh the host idle timer), done(path,
  * seconds, tokens, sampleRate) and error(id, message). Cancellation is
  * the host killing the process group; stdin EOF exits.
+ *
+ * The optional "abc" string carries a user-supplied ABC score (lyra's
+ * SongRequest.abc): its text tokens become the ABC prefix and the planning
+ * AR pass is skipped. Omitting it keeps the original planning behaviour.
  *
  * The initial acoustic noise comes from the engine-local splitmix64
  * stream (M0 decision, documented): same seed does NOT replay lyra's
@@ -47,15 +51,17 @@
 #include "yue_sampling.h"
 #include "yue_vae.h"
 
-/* Original argv, kept for the serve-mode execve self-restart. */
-static char **g_argv;
-
 #define YUE_DIR_MAX 1024
 /* Request output paths (and the scratch WAV next to them) must fit. */
 #define YUE_OUTPUT_MAX 3072
 /* Request lines carry full lyrics as JSON; lyrics are capped by the
  * semantic budget anyway (max_tokens <= 9000), 512 KB is generous. */
 #define SERVE_LINE_MAX (512u * 1024u)
+/* User-supplied ABC scores: mirror the yue2-web lyrics cap and the ABC
+ * planning stage's own max_tokens, so an external score cannot make the
+ * prefill longer than a model-planned one. */
+#define YUE_ABC_TEXT_MAX 20000u
+#define YUE_ABC_TOKENS_MAX 4096u
 
 typedef struct {
     char model_dir[YUE_DIR_MAX];
@@ -489,11 +495,64 @@ static float rng_normal(yue_rng *rng) {
 
 /* -------------------------------------------------------- the pipeline */
 
+/* Encode a user-supplied ABC score into ordinary text ids that
+ * yue_token_prefixes() wraps in ABC_START..ABC_END. This mirrors the
+ * official SymbolicPlan path (tokenizer.encode(request.abc)) including its
+ * "ids stay inside the ordinary text vocabulary" check. The text is encoded
+ * verbatim: SongRequest only strips whitespace to test emptiness, it never
+ * strips the bytes fed to the tokenizer. */
+static int abc_text_blank(const char *s) {
+    for (; *s; s++)
+        if (*s != ' ' && *s != '\t' && *s != '\r' && *s != '\n' &&
+            *s != '\v' && *s != '\f')
+            return 0;
+    return 1;
+}
+
+static int encode_external_abc(const h3_tokenizer *tok, const char *text,
+                               uint32_t **out, size_t *count,
+                               char *error, size_t error_size) {
+    *out = NULL;
+    *count = 0;
+    if (abc_text_blank(text)) {
+        snprintf(error, error_size, "abc score is empty or whitespace-only");
+        return 0;
+    }
+    if (strlen(text) > YUE_ABC_TEXT_MAX) {
+        snprintf(error, error_size, "abc text exceeds %u bytes",
+                 YUE_ABC_TEXT_MAX);
+        return 0;
+    }
+    uint32_t *ids = NULL;
+    size_t n = 0;
+    if (!h3_tokenizer_encode(tok, text, 0, &ids, &n, error, error_size))
+        return 0;
+    if (n == 0 || n > YUE_ABC_TOKENS_MAX) {
+        h3_tokenizer_ids_free(ids);
+        snprintf(error, error_size,
+                 "abc must encode to 1..%u tokens (got %zu)",
+                 YUE_ABC_TOKENS_MAX, n);
+        return 0;
+    }
+    for (size_t i = 0; i < n; i++) {
+        if (ids[i] >= YUE_EOD) {
+            h3_tokenizer_ids_free(ids);
+            snprintf(error, error_size,
+                     "abc contains a special token id at position %zu", i);
+            return 0;
+        }
+    }
+    *out = ids;
+    *count = n;
+    return 1;
+}
+
 /* One full song: plan -> semantic -> acoustic flow -> decode -> FLAC.
  * Returns 1 on success. Progress events fire in serve mode; both modes
  * log the stage timings to stderr like the reference worker. */
 static int run_song(yue_engine *eng, const char *style, const char *lyrics,
                     int cot, double guidance, uint64_t seed,
+                    const uint32_t *ext_abc, size_t ext_abc_count,
                     const char *output, size_t *out_frames,
                     double *out_seconds, char *error, size_t error_size) {
     yue_generation *abc_gen = NULL;
@@ -506,8 +565,10 @@ static int run_song(yue_engine *eng, const char *style, const char *lyrics,
     uint32_t *chunk_tokens = NULL; /* per-chunk scratch, freed inline */
     yue_chunk_range *ranges = NULL;
     char *wav_tmp = NULL;
-    const uint32_t *abc_ids = NULL;
-    size_t abc_count = 0;
+    /* An external score replaces the planning pass; these ids stay borrowed
+     * from the caller (serve_handle / repl_generate owns them). */
+    const uint32_t *abc_ids = ext_abc;
+    size_t abc_count = ext_abc_count;
     size_t sem_len = 0;
     size_t neg_len = 0;
     size_t frames = 0;
@@ -521,9 +582,18 @@ static int run_song(yue_engine *eng, const char *style, const char *lyrics,
     memset(&tp_abc, 0, sizeof(tp_abc));
     memset(&tp_sem, 0, sizeof(tp_sem));
 
-    /* ---- stage 1: ABC planning (cot=off skips the AR pass) ---- */
-    serve_stage("abc", 0.0, 1);
-    if (cot != YUE_COT_OFF) {
+    if (ext_abc_count && cot == YUE_COT_OFF) {
+        snprintf(error, error_size,
+                 "an external abc requires cot=full or cot=melody");
+        goto cleanup;
+    }
+
+    /* ---- stage 1: ABC planning (cot=off or an external score skips it) ---- */
+    if (ext_abc_count)
+        serve_stage("abc", 1.0, 1); /* no AR pass: close the stage at once */
+    else
+        serve_stage("abc", 0.0, 1);
+    if (cot != YUE_COT_OFF && !ext_abc_count) {
         uint32_t *plan_prefix = NULL;
         size_t plan_len = 0;
         if (!yue_token_prefixes(eng->tokenizer, style, lyrics, cot, NULL, 0,
@@ -721,10 +791,30 @@ static void serve_handle(yue_engine *eng, const yw_json *req) {
     char *lyrics = dup_trim(yw_json_get_string(req, "lyrics", ""));
     char *cot_s = dup_trim(yw_json_get_string(req, "cot", "full"));
     char *output = dup_trim(yw_json_get_string(req, "output", ""));
+    char *abc_text = NULL;
+    uint32_t *abc_ids = NULL;
+    size_t abc_count = 0;
+    /* "abc" is optional; JSON null means "no score" (SongRequest.abc=None),
+     * other non-string values are a protocol error. The text is kept verbatim
+     * -- trimming it would change the BPE ids compared with the official
+     * tokenizer.encode(request.abc). */
+    const yw_json *abc_j = yw_json_get(req, "abc");
+    int has_abc = abc_j && yw_json_type(abc_j) != yue_json_NULL;
     int failed = !style || !lyrics || !cot_s || !output;
     if (failed) {
         serve_error(rid, "out of memory");
         goto done;
+    }
+    if (has_abc && yw_json_type(abc_j) != yue_json_STRING) {
+        serve_error(rid, "abc must be a string or null");
+        goto done;
+    }
+    if (has_abc) {
+        abc_text = strdup(yw_json_get_string(req, "abc", ""));
+        if (!abc_text) {
+            serve_error(rid, "out of memory");
+            goto done;
+        }
     }
     if (!*style) {
         serve_error(rid, "style cannot be empty");
@@ -747,6 +837,13 @@ static void serve_handle(yue_engine *eng, const yw_json *req) {
     int cot = yue_cot_index(cot_s);
     if (cot < 0) {
         serve_error(rid, "cot must be full/melody/off, received %s", cot_s);
+        goto done;
+    }
+    /* cot=off has no ABC section in the prefix, so the official protocol
+     * rejects an external score there (SongRequest.__post_init__). */
+    if (has_abc && cot == YUE_COT_OFF) {
+        serve_error(rid, "abc requires cot=full or cot=melody "
+                         "(cot=off has no ABC section)");
         goto done;
     }
     if (!*output) {
@@ -806,10 +903,25 @@ static void serve_handle(yue_engine *eng, const yw_json *req) {
         }
         double guidance = yue_request_guidance(cot, cfg_value, has_cfg);
 
+        /* An external score is encoded here (before any GPU work) and its
+         * ids are used for both the positive and the symbolic CFG negative
+         * prefix; the ABC planning AR pass is then skipped in run_song. */
+        if (has_abc &&
+            !encode_external_abc(eng->tokenizer, abc_text, &abc_ids,
+                                 &abc_count, error, sizeof(error))) {
+            serve_error(rid, "%s", error);
+            goto done;
+        }
+
         double t0 = now_seconds();
-        log_stderr("job %s: cot=%s cfg=%s seed=%llu lyrics=%zu ch",
+        log_stderr("job %s: cot=%s cfg=%s seed=%llu lyrics=%zu ch abc=%s",
                    rid, cot_s, has_cfg ? "explicit" : "auto",
-                   (unsigned long long)seed, strlen(lyrics));
+                   (unsigned long long)seed, strlen(lyrics),
+                   abc_count ? "external"
+                             : (cot == YUE_COT_OFF ? "none" : "planned"));
+        if (abc_count)
+            log_stderr("job %s: external abc encoded to %zu tokens", rid,
+                       abc_count);
 
         pthread_mutex_lock(&g_prog.mu);
         snprintf(g_prog.rid, sizeof(g_prog.rid), "%s", rid);
@@ -823,7 +935,8 @@ static void serve_handle(yue_engine *eng, const yw_json *req) {
 
         size_t frames = 0;
         double seconds = 0.0;
-        int ok = run_song(eng, style, lyrics, cot, guidance, seed, output,
+        int ok = run_song(eng, style, lyrics, cot, guidance, seed,
+                          abc_ids, abc_count, output,
                           &frames, &seconds, error, sizeof(error));
 
         pthread_mutex_lock(&g_prog.mu);
@@ -850,6 +963,8 @@ static void serve_handle(yue_engine *eng, const yw_json *req) {
     }
 
 done:
+    h3_tokenizer_ids_free(abc_ids);
+    free(abc_text);
     free(output);
     free(cot_s);
     free(lyrics);
@@ -1056,6 +1171,18 @@ static int cmd_serve(const char *model_dir, const char *vae_dir) {
                        "driver-held Metal pages",
                        served);
             if (_NSGetExecutablePath(exe, &size) == 0) {
+                /* Rebuild the restart argv from the RESOLVED absolute
+                 * paths instead of replaying the original argv:
+                 * ensure_shader_dir() may have chdir'd to the executable
+                 * directory, so a relative -d/--vae (or a relative
+                 * argv[0]) would resolve against the new cwd and the
+                 * restarted image would fail to find the model. The
+                 * serve mode only takes -d/--vae, so this reconstruction
+                 * is lossless. */
+                char *restart_argv[] = {(char *)exe,  (char *)"serve",
+                                        (char *)"-d", (char *)model_dir,
+                                        (char *)"--vae", (char *)vae_dir,
+                                        NULL};
                 /* Quiesce the heartbeat under the emitter's lock: execve()
                  * destroys that thread instantly, so no emit may be in
                  * flight and none may start before the new image runs. */
@@ -1063,7 +1190,7 @@ static int cmd_serve(const char *model_dir, const char *vae_dir) {
                 g_restarting = 1;
                 fflush(NULL);
                 pthread_mutex_unlock(&g_emit_mu);
-                execv(exe, g_argv);
+                execv(exe, restart_argv);
                 int saved_errno = errno;
                 pthread_mutex_lock(&g_emit_mu);
                 g_restarting = 0;
@@ -1083,6 +1210,7 @@ static int cmd_serve(const char *model_dir, const char *vae_dir) {
 typedef struct {
     char *style;
     char *lyrics;
+    char *abc; /* optional user-supplied ABC score; NULL = plan it */
     int cot;
     double cfg_scale; /* 0 = auto (1.01 when cot=off, else 1.0) */
     uint64_t seed;
@@ -1123,6 +1251,22 @@ static void unescape_inplace(char *s) {
     *w = '\0';
 }
 
+/* ABC notation has no backslash escapes of its own. Only the explicit \n
+ * separator for one-line /abc input is expanded; every other byte (including
+ * backslashes) stays verbatim, matching /abc-file and the serve "abc" field. */
+static void unescape_abc_newlines(char *s) {
+    char *w = s;
+    for (char *r = s; *r; r++) {
+        if (r[0] == '\\' && r[1] == 'n') {
+            *w++ = '\n';
+            r++;
+        } else {
+            *w++ = *r;
+        }
+    }
+    *w = '\0';
+}
+
 static int set_field(char **field, const char *value) {
     char *copy = strdup(value);
     if (!copy) {
@@ -1151,6 +1295,9 @@ static void repl_show(const repl_state *st) {
         putchar(lyrics[i] == '\n' ? ' ' : lyrics[i]);
     if (len > 400) printf(" ...");
     putchar('\n');
+    printf("abc: %s\n", st->abc && *st->abc
+                            ? "user-supplied score (planning skipped)"
+                            : "none (model plans its own)");
 }
 
 static void repl_generate(yue_engine *eng, repl_state *st) {
@@ -1173,9 +1320,23 @@ static void repl_generate(yue_engine *eng, repl_state *st) {
     char error[YUE_ERROR_SIZE] = {0};
     size_t frames = 0;
     double seconds = 0.0;
+    uint32_t *abc_ids = NULL;
+    size_t abc_count = 0;
+    if (st->abc && *st->abc) {
+        if (st->cot == YUE_COT_OFF) {
+            printf("abc requires cot=full or cot=melody (use /cot full)\n");
+            return;
+        }
+        if (!encode_external_abc(eng->tokenizer, st->abc, &abc_ids,
+                                 &abc_count, error, sizeof(error))) {
+            printf("error: %s\n", error);
+            return;
+        }
+    }
     int done = run_song(eng, st->style, st->lyrics, st->cot, guidance,
-                        st->seed, out, &frames, &seconds, error,
-                        sizeof(error));
+                        st->seed, abc_ids, abc_count, out, &frames,
+                        &seconds, error, sizeof(error));
+    h3_tokenizer_ids_free(abc_ids);
     /* Same request boundary as serve: each song has its own prefix length,
      * and without this every new length pins a ~95 MB MPSGraph compile for
      * the whole REPL session. */
@@ -1194,6 +1355,9 @@ static void print_help(void) {
     printf("/style TEXT        style tags (required)\n"
            "/lyrics TEXT       lyrics; \\n escapes a newline (required)\n"
            "/lyrics-file PATH  load lyrics from a UTF-8 file\n"
+           "/abc TEXT          ABC score; \\n makes a newline; bare /abc clears\n"
+           "/abc-file PATH     load an ABC score verbatim from a UTF-8 file\n"
+           "                   external scores need cot=full/melody (not off)\n"
            "/cot full|melody|off  decoding mode (default full)\n"
            "/cfg X             explicit CFG scale; 0 = auto\n"
            "/seed N            base seed (default 831001, lyra default)\n"
@@ -1216,6 +1380,33 @@ static void repl_command(yue_engine *eng, repl_state *st, const char *line) {
     }
     if (!strcmp(line, "/gen")) {
         repl_generate(eng, st);
+        return;
+    }
+    if ((arg = arg_after(line, "/abc-file")) != NULL) {
+        if (!*arg) {
+            printf("usage: /abc-file PATH\n");
+            return;
+        }
+        char *text = read_text_file(arg);
+        if (!text) {
+            printf("cannot read %s\n", arg);
+            return;
+        }
+        free(st->abc);
+        st->abc = text; /* verbatim, like the official abc_path read */
+        printf("abc: %zu bytes (cot=%s)\n", strlen(st->abc),
+               cot_name(st->cot));
+        return;
+    }
+    if ((arg = arg_after(line, "/abc")) != NULL) {
+        if (!*arg) { /* bare /abc clears the score */
+            free(st->abc);
+            st->abc = NULL;
+            printf("abc: cleared (model will plan its own score)\n");
+            return;
+        }
+        if (!set_field(&st->abc, arg)) return;
+        unescape_abc_newlines(st->abc);
         return;
     }
     if ((arg = arg_after(line, "/style")) != NULL) {
@@ -1336,7 +1527,7 @@ static int cmd_repl(const char *model_dir, const char *vae_dir) {
                now_seconds() - t0, model_dir, vae_dir);
     printf("yue repl: /help for commands\n");
 
-    repl_state st = {NULL, NULL, YUE_COT_FULL, 0.0, 831001, "out", 0};
+    repl_state st = {NULL, NULL, NULL, YUE_COT_FULL, 0.0, 831001, "out", 0};
     set_field(&st.style, "");
     set_field(&st.lyrics, "");
 
@@ -1354,6 +1545,7 @@ static int cmd_repl(const char *model_dir, const char *vae_dir) {
     }
     free(st.style);
     free(st.lyrics);
+    free(st.abc);
     /* The lock fd and the engine are released by process exit (see
      * engine_free): shutdown must not unmap ~20 GB of lazily-paged
      * weights page by page. */
@@ -1408,7 +1600,6 @@ static void default_gemv_env(void) {
 }
 
 int main(int argc, char **argv) {
-    g_argv = argv;
     default_gemv_env();
     if (argc < 2) {
         fprintf(stderr,

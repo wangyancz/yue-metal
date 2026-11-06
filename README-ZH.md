@@ -108,6 +108,9 @@ REPL 指令：
 /style TEXT        风格标签（必填）
 /lyrics TEXT       歌词；\n 转义换行（必填）
 /lyrics-file PATH  从 UTF-8 文件读歌词
+/abc TEXT          自供 ABC 乐谱；\n 表示换行；裸 /abc 清空
+/abc-file PATH     从 UTF-8 文件原样读取 ABC 乐谱
+                   自供谱要求 cot=full/melody（off 不可用）
 /cot full|melody|off  解码模式（默认 full）
 /cfg X             显式 CFG；0 = 自动
 /seed N            基础种子（默认 831001，lyra 默认值；每次 /gen 后自增）
@@ -117,9 +120,16 @@ REPL 指令：
 
 ## JSONL 协议（serve）
 
-- 请求：`{"id","style","lyrics","cot","cfgScale","seed","output"}`（行上限 512KB；
+- 请求：`{"id","style","lyrics","cot","cfgScale","seed","output","abc"}`（行上限 512KB；
   校验对齐 worker.py：cfgScale 仅 NUMBER 且 >0 生效、范围 [0,20]；seed ∈ [0,2^63)；
   output 必须带 `.flac`）。
+- `"abc"` 为可选 STRING，携带用户自供的 ABC 乐谱（lyra `SongRequest.abc`）。
+  其文本 token 同时用于正分支与符号 CFG 负分支的 ABC 前缀，因此**跳过乐谱
+  规划相位**（abc 进度阶段立即置满）。要求 `cot=full` 或 `cot=melody`；
+  `cot=off` 没有乐谱段会直接报错。`abc: null` 或缺字段 = 不提供乐谱
+  （对应 `SongRequest.abc=None`）；空串/纯空白会报错。文本**原样编码、不裁剪**
+  首尾空白，保证 BPE 与 `tokenizer.encode(request.abc)` 一致。限制：20000
+  字节 / 4096 token，所有 id 须 < `YUE_EOD`。不传该字段时行为与旧路径逐位一致。
 - 事件：`state loading/ready(loadSeconds)` → `progress(id/stage/percent/elapsed[,
   heartbeat])` → `done(path/seconds/tokens/sampleRate)` 或 `error(id/message)`。
 - 进度阶段：`abc 0.02-0.38`（cot=off 时空转）→ `semantic 0.40-0.78` → `flow 0.80-0.94`

@@ -122,6 +122,9 @@ REPL commands:
 /style TEXT        style tags (required)
 /lyrics TEXT       lyrics; \n escapes a newline (required)
 /lyrics-file PATH  read lyrics from a UTF-8 file
+/abc TEXT          ABC score; \n makes a newline; bare /abc clears it
+/abc-file PATH     read an ABC score verbatim from a UTF-8 file
+                   external scores need cot=full/melody (not off)
 /cot full|melody|off  decoding mode (default full)
 /cfg X             explicit CFG; 0 = auto
 /seed N            base seed (default 831001, lyra's default; auto-increments after each /gen)
@@ -131,9 +134,19 @@ REPL commands:
 
 ## JSONL Protocol (serve)
 
-- Request: `{"id","style","lyrics","cot","cfgScale","seed","output"}` (512KB
+- Request: `{"id","style","lyrics","cot","cfgScale","seed","output","abc"}` (512KB
   line limit; validation mirrors worker.py: cfgScale only takes effect when it
   is a NUMBER > 0, range [0,20]; seed ∈ [0,2^63); `output` must end in `.flac`).
+- `"abc"` is an optional STRING carrying a user-supplied ABC score (lyra's
+  `SongRequest.abc`). Its text ids become the ABC prefix for both the positive
+  and the symbolic-CFG negative branch, so the planning AR pass is skipped
+  (the `abc` progress stage closes immediately). Requires `cot=full` or
+  `cot=melody`; `cot=off` has no ABC section and rejects it. `abc: null` or a
+  missing key means "no score" (`SongRequest.abc=None`); an empty or
+  whitespace-only string is rejected. The text is encoded **verbatim** (never
+  trimmed) so its BPE ids match `tokenizer.encode(request.abc)`. Limits: 20000
+  bytes / 4096 tokens, all ids < `YUE_EOD`. Omitting it keeps the original
+  planning path bit-identical.
 - Events: `state loading/ready(loadSeconds)` → `progress(id/stage/percent/
   elapsed[, heartbeat])` → `done(path/seconds/tokens/sampleRate)` or
   `error(id/message)`.

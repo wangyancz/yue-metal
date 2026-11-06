@@ -1271,6 +1271,19 @@ int yue_write_wav24(const char *path, const float *samples, size_t frames,
     return 1;
 }
 
+/* ffmpeg parses a leading '-' as an option (argv is not a shell): prefix
+ * such relative paths with "./" (same file, same cwd). */
+static char *dash_safe_path(const char *path) {
+    if (!path || path[0] != '-') return NULL;
+    size_t n = strlen(path);
+    char *normalized = malloc(n + 3);
+    if (!normalized) return NULL;
+    normalized[0] = '.';
+    normalized[1] = '/';
+    memcpy(normalized + 2, path, n + 1);
+    return normalized;
+}
+
 int yue_wav_to_flac(const char *wav_path, const char *flac_path, char *error,
                     size_t error_size) {
     if (!wav_path || !flac_path) {
@@ -1279,34 +1292,33 @@ int yue_wav_to_flac(const char *wav_path, const char *flac_path, char *error,
     }
     /* posix_spawnp with an argument array (same discipline as h3_ffmpeg.c):
      * paths are passed verbatim, so quotes or shell metacharacters in the
-     * output filename can neither break the command nor inject code. A
-     * leading '-' would still be parsed by ffmpeg as an option (argv is not
-     * a shell), so prefix such relative paths with ./ (same file, same cwd). */
+     * output filename can neither break the command nor inject code. Both
+     * arguments are dash-normalized: the scratch WAV derives from the
+     * output path, so a leading '-' would otherwise be parsed as an option
+     * on "-i" too (the output side alone was normalized before). */
     const char *override = getenv("H3_FFMPEG");
     const char *program = override && *override ? override : "ffmpeg";
-    char *normalized = NULL;
-    const char *out_arg = flac_path;
-    if (flac_path[0] == '-') {
-        size_t n = strlen(flac_path);
-        normalized = malloc(n + 3);
-        if (!normalized) {
-            set_error(error, error_size, "out of memory (flac path)");
-            return 0;
-        }
-        normalized[0] = '.';
-        normalized[1] = '/';
-        memcpy(normalized + 2, flac_path, n + 1);
-        out_arg = normalized;
+    char *normalized_in = dash_safe_path(wav_path);
+    char *normalized_out = dash_safe_path(flac_path);
+    if ((wav_path[0] == '-' && !normalized_in) ||
+        (flac_path[0] == '-' && !normalized_out)) {
+        set_error(error, error_size, "out of memory (flac path)");
+        free(normalized_in);
+        free(normalized_out);
+        return 0;
     }
+    const char *in_arg = normalized_in ? normalized_in : wav_path;
+    const char *out_arg = normalized_out ? normalized_out : flac_path;
     char *arguments[] = {(char *)program, "-y", "-loglevel", "error", "-i",
-                         (char *)wav_path, "-c:a", "flac",
+                         (char *)in_arg, "-c:a", "flac",
                          (char *)out_arg, NULL};
     pid_t child = -1;
     int code = posix_spawnp(&child, program, NULL, NULL, arguments, environ);
     if (code != 0) {
         set_error(error, error_size, "cannot start ffmpeg: %s",
                   strerror(code));
-        free(normalized);
+        free(normalized_in);
+        free(normalized_out);
         return 0;
     }
     int status = 0;
@@ -1314,17 +1326,18 @@ int yue_wav_to_flac(const char *wav_path, const char *flac_path, char *error,
         if (errno == EINTR) continue;
         set_error(error, error_size, "cannot wait for ffmpeg: %s",
                   strerror(errno));
-        free(normalized);
+        free(normalized_in);
+        free(normalized_out);
         return 0;
     }
+    free(normalized_in);
+    free(normalized_out);
     if (!WIFEXITED(status) || WEXITSTATUS(status) != 0) {
         set_error(error, error_size, "ffmpeg flac encode failed (%s)",
                   WIFEXITED(status)
                       ? "check input/output paths"
                       : "killed by signal");
-        free(normalized);
         return 0;
     }
-    free(normalized);
     return 1;
 }

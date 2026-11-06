@@ -293,15 +293,23 @@ yue_nar *yue_nar_create(h3_gpu *gpu, yue_ar *ar, const char *model_dir,
             size_t got = fread(text, 1, sizeof(text) - 1, file);
             fclose(file);
             text[got] = '\0';
-            const char *key = strstr(text, "\"timestep_shift\"");
-            if (key) {
-                const char *colon = strchr(key, ':');
-                if (colon) {
-                    /* A zero or negative shift makes the shifted timestep
-                     * degenerate (0/(1-t)); fall back to the reference
-                     * default instead of silently corrupting the schedule. */
-                    float value = (float)atof(colon + 1);
-                    nar->timestep_shift = value > 0.0f ? value : 1.0f;
+            /* A config that fills the buffer was truncated mid-JSON: the
+             * strstr/atof scan below could read a half-written number and
+             * produce a wrong-but-positive shift. Keep the reference
+             * default instead (same policy as the generation-config
+             * short-read rejection). */
+            if (got < sizeof(text) - 1) {
+                const char *key = strstr(text, "\"timestep_shift\"");
+                if (key) {
+                    const char *colon = strchr(key, ':');
+                    if (colon) {
+                        /* A zero or negative shift makes the shifted
+                         * timestep degenerate (0/(1-t)); fall back to the
+                         * reference default instead of silently corrupting
+                         * the schedule. */
+                        float value = (float)atof(colon + 1);
+                        nar->timestep_shift = value > 0.0f ? value : 1.0f;
+                    }
                 }
             }
         }
