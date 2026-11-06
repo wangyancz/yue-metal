@@ -5,7 +5,7 @@ English | [简体中文](README-ZH.md)
 A native inference engine for the YuE2-3B song-generation model (AR semantic
 tokens + NAR acoustic flow matching + Oobleck VAE), written in plain C11 +
 Objective-C/Metal for Apple Silicon (unified memory, M-series). Numerical
-conventions reproduce the reference stack lyra (MLX port, `/Volumes/Work/mlx-Yue`,
+conventions reproduce the reference stack lyra (MLX port, including its vendored
 including its vendored official yue2 protocol layer) point by point; AR greedy
 output is bit-identical to lyra (see "Numerical Conventions").
 
@@ -52,10 +52,10 @@ Historical: M10 (321-char request profile) semantic 19.9 ms/token, RTF 0.80
 
 ## Model & Dependencies
 
-- Weights: `/Volumes/Work/models/YuE2.models/YuE2-3B` (the official m-a-p
-  single-file `model.safetensors`) plus the `YuE2-Vae` directory (when `--vae`
-  is omitted it is derived as `<model>-vae`; the official naming requires an
-  explicit `--vae`).
+- Weights: a directory containing the official m-a-p single-file
+  `model.safetensors` (the `YuE2-3B` checkpoint), plus the `YuE2-Vae`
+  directory (when `--vae` is omitted it is derived as `<model>-vae`; the
+  official naming requires an explicit `--vae`).
 - The lyra conversion layout is also supported directly: point `-d` at a
   directory containing `ar-bf16`/`nar-bf16.safetensors` (byte-identical to the
   official single file, verified by sha256 across all 628 tensors; the engine
@@ -63,8 +63,8 @@ Historical: M10 (321-char request profile) semantic 19.9 ms/token, RTF 0.80
   keys/shapes/dtypes are fully isomorphic between both layouts. The official
   directory ships a `yue2_generation_config.json` that matches the built-in
   defaults field by field.
-- Reference stack: `/Volumes/Work/mlx-Yue` (lyra MLX package + its `.venv`;
-  only used to generate test fixtures).
+- Reference stack: the lyra MLX package (mlx-Yue) + its `.venv`; only used to
+  generate test fixtures.
 - Runtime dependencies: Metal, MetalPerformanceShaders(+Graph), Accelerate,
   ffmpeg (see the ffmpeg section below).
 
@@ -110,7 +110,7 @@ make m0-tests tokenizer-tests gemv-tests ar-tests sampling-tests nar-tests vae-t
 ```sh
 # JSONL service mode
 printf '%s\n' '{"id":"t","style":"upbeat pop","lyrics":"[verse]\nla la la\n[chorus]\nna na na","cot":"off","cfgScale":1.2,"seed":831001,"output":"/tmp/t.flac"}' \
-  | ./yue serve -d /Volumes/Work/models/YuE2.models/YuE2-3B --vae /Volumes/Work/models/YuE2.models/YuE2-Vae
+  | ./yue serve -d /path/to/YuE2-3B --vae /path/to/YuE2-Vae
 
 # Persistent REPL (linenoise)
 ./yue repl -d MODEL_DIR [--vae VAE_DIR]
