@@ -54,7 +54,35 @@ kv>4096 区间的注意力耗时 +10-20%），详见性能节。
   官方目录自带 `yue2_generation_config.json`（与内置默认逐字段一致）。
 - 参考栈：`/Volumes/Work/mlx-Yue`（lyra MLX 包 + 其 `.venv`，仅测试 fixture 生成时使用；
   fixture 的 `.npy/.json` 已固化在 tests/ 下，重跑生成脚本需先用官方权重重做 lyra 转换）。
-- 运行依赖：Metal、MetalPerformanceShaders(+Graph)、Accelerate、ffmpeg（FLAC 转码，PATH 中可用）。
+- 运行依赖：Metal、MetalPerformanceShaders(+Graph)、Accelerate、ffmpeg（见下方
+  ffmpeg 小节）。
+
+### ffmpeg（唯一非系统框架的运行依赖）
+
+引擎的 save 阶段先写出中间 24-bit WAV（`yue_write_wav24`），再进程内调用
+`ffmpeg -y -i tmp.wav -c:a flac out.flac` 转码为 FLAC（`posix_spawnp` 启动，
+不经 shell）。这是本引擎对 ffmpeg 的**唯一**用途——不用 ffprobe，也不做任何
+图像/视频解码（`h3_ffmpeg.c` 里的那些 helper 是从 qwen 侧 vendor 来的，此处
+未使用）。FLAC 无损，输出为 24-bit / 48kHz / stereo。
+
+安装（任选其一）：
+
+```sh
+brew install ffmpeg                 # Homebrew（推荐）
+sudo port install ffmpeg            # MacPorts
+# 或下载 macOS 静态构建：https://evermeet.cx/ffmpeg/
+#   并用 H3_FFMPEG 指向该二进制（见环境变量表）
+```
+
+验证：
+
+```sh
+ffmpeg -version    # 任意较新的 4.x/5.x/6.x/7.x 均可
+```
+
+若缺少 ffmpeg：生成本身会正常完成，但 save 阶段报
+`cannot start ffmpeg: ...`（或 `ffmpeg flac encode failed`）失败；可用
+`H3_FFMPEG=/path/to/ffmpeg` 指向不在 PATH 中的二进制。
 
 ## 构建
 
@@ -286,7 +314,7 @@ REPL 指令：
 | `H3_QKV_GEMV_KERNEL` | qw_gemv_qkv_bf16_u8 | 融合 GEMV 变体（u4/u8 或 2D `qw_gemv2d_qkv_m32u8`/`m64u8`，后者要求 out_q/out_kv 可整除 row_tile） |
 | `H3_ZERO_COPY_WEIGHTS` | 1 | 权重 mmap 零拷贝（不计 footprint、可按需重读）；=0 私有拷贝。M8 实测对 GEMV/MPS 性能均无影响 |
 | `YUE_VAE_CPU` | 关 | =1 VAE 解码走 Accelerate CPU 参考路径（GPU 路径对照/救火） |
-| `H3_FFMPEG` / `H3_FFPROBE` | 无 | 覆盖 ffmpeg/ffprobe 可执行路径（WAV24→FLAC 转码用，默认取 PATH） |
+| `H3_FFMPEG` / `H3_FFPROBE` | 无 | 覆盖 ffmpeg/ffprobe 可执行路径；yue 本体只用 ffmpeg（WAV24→FLAC，见 ffmpeg 小节），ffprobe 仅 vendored 的 qwen 侧 helper 使用。默认取 PATH |
 | `YUE_SDPA_FLASH2` | 关 | =1 decode 步注意力回退 flash2 tile 内核（默认 split-K 标量对：probe U kv=513 134→28.5µs，见性能节 M10） |
 | `YUE_HN_ROPE_SEPARATE` | 关 | =1 q/k head-norm+rope 回退四内核路径（默认融合单 dispatch：位级一致，probe T +1.39 ms/branch，见性能节 M11） |
 | `YUE_AR_CONTINUE_EVERY` | 1 | 层尾 commit 粒度（每 N 层一次 continue；实测 GPU busy 持平） |

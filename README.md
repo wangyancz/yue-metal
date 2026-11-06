@@ -66,7 +66,37 @@ Historical: M10 (321-char request profile) semantic 19.9 ms/token, RTF 0.80
 - Reference stack: `/Volumes/Work/mlx-Yue` (lyra MLX package + its `.venv`;
   only used to generate test fixtures).
 - Runtime dependencies: Metal, MetalPerformanceShaders(+Graph), Accelerate,
-  ffmpeg (FLAC transcoding; available on PATH).
+  ffmpeg (see the ffmpeg section below).
+
+### ffmpeg (the only non-framework runtime dependency)
+
+The engine's save stage first writes an intermediate 24-bit WAV
+(`yue_write_wav24`), then transcodes it to FLAC in-process via
+`ffmpeg -y -i tmp.wav -c:a flac out.flac` (spawned with `posix_spawnp`, no
+shell involved). This is the **only** use of ffmpeg in this engine — no
+ffprobe, no image/video decoding (the `h3_ffmpeg.c` helpers for those are
+vendored from the qwen side and unused here). FLAC is lossless; output is
+24-bit / 48 kHz / stereo.
+
+Install (any one):
+
+```sh
+brew install ffmpeg                 # Homebrew (recommended)
+sudo port install ffmpeg            # MacPorts
+# or grab a static build for macOS: https://evermeet.cx/ffmpeg/
+#   and point H3_FFMPEG at the binary (see Environment Variables)
+```
+
+Verify:
+
+```sh
+ffmpeg -version    # any reasonably recent 4.x/5.x/6.x/7.x build works
+```
+
+If ffmpeg is missing, generation itself completes but the save stage fails
+with `cannot start ffmpeg: ...` (or `ffmpeg flac encode failed`); the
+`H3_FFMPEG=/path/to/ffmpeg` environment variable points the engine at a
+binary that is not on PATH.
 
 ## Build
 
@@ -368,7 +398,7 @@ REPL commands:
 | `H3_QKV_GEMV_KERNEL` | qw_gemv_qkv_bf16_u8 | fused GEMV variant (u4/u8 or 2D `qw_gemv2d_qkv_m32u8`/`m64u8`; the latter requires out_q/out_kv divisible by row_tile) |
 | `H3_ZERO_COPY_WEIGHTS` | 1 | zero-copy mmap weights (not counted in footprint, re-readable on demand); =0 private copies. M8 measured no performance impact on GEMV or MPS |
 | `YUE_VAE_CPU` | off | =1 runs VAE decode on the Accelerate CPU reference path (GPU-path comparison / fallback) |
-| `H3_FFMPEG` / `H3_FFPROBE` | none | override ffmpeg/ffprobe executables (WAV24→FLAC transcoding; PATH by default) |
+| `H3_FFMPEG` / `H3_FFPROBE` | none | override ffmpeg/ffprobe executables; yue itself only calls ffmpeg (WAV24→FLAC, see the ffmpeg section) — ffprobe is used only by the vendored qwen-side helpers. PATH by default |
 | `YUE_SDPA_FLASH2` | off | =1 falls decode-step attention back to the flash2 tile kernel (default split-K scalar pair: probe U kv=513 134→28.5µs, see M10) |
 | `YUE_HN_ROPE_SEPARATE` | off | =1 falls q/k head-norm+rope back to the four-kernel path (default fused single dispatch: bit-identical, probe T +1.39 ms/branch, see M11) |
 | `YUE_AR_CONTINUE_EVERY` | 1 | layer-tail commit granularity (continue every N layers; measured GPU busy unchanged) |
